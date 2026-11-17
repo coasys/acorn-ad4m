@@ -368,3 +368,78 @@ test("failed full reads with a hung sibling start no new call for it across retr
   assert.equal(unsettled, 1);
   assert.equal(counts.fetch_tags, 4, "the rejected collection is re-read on each retry");
 });
+
+// ---- a hung local call cannot hold a snapshot forever (Lal round 5, P2)
+//
+// One local collection never settles while every other read succeeds (no
+// rejecting sibling masks the hang). The snapshot must reject at its
+// deadline; the hung call stays pooled (no second call while it is
+// unsettled); when it finally settles, the abandoned snapshot applies
+// neither its data nor an absence strike; a later snapshot succeeds.
+
+test("a snapshot with a hung collection rejects at its deadline; its late result applies nothing", async () => {
+  let outcomeCalls = 0;
+  let settle: ((rows: any[]) => void) | null = null;
+  let outcomes: () => Promise<any[]> = async () => [outcomeA()];
+  (globalThis as any).__acornHost = {
+    holochainRegisterDnas: async () => [{}],
+    agentDid: () => "did:key:zTestExecutor",
+    languageAddress: () => LANG,
+    emitSignal: () => {},
+    holochainCall: (_n: string, _z: string, fn: string) => {
+      if (fn === "fetch_outcomes") {
+        outcomeCalls++;
+        return outcomes();
+      }
+      return Promise.resolve(fn === "fetch_project_meta" ? null : []);
+    },
+  };
+  const dir = mkdtempSync(join(tmpdir(), "acorn-snap-"));
+  const entry = join(dir, "entry.ts");
+  const src = (f: string) => JSON.stringify(join(HERE, "..", "..", "src", f));
+  writeFileSync(
+    entry,
+    `export * from ${src("snapshot.ts")};\nexport { mountState } from ${src("state.ts")};`
+  );
+  const mod = await loadLanguage({}, entry);
+  rmSync(dir, { recursive: true, force: true });
+  const A = OUTCOME_A;
+  const B = OUTCOME_B;
+  const strikes = (a: string) => (mod.mountState as any).absent.get(a)?.count ?? 0;
+
+  await mod.resyncSnapshot(LANG, {}, { deadlineMs: 100 });
+  assert.ok(mod.mountState.entries.has(A), "A mounted by the first snapshot");
+
+  // the outcomes read now hangs (until `settle`); it would list B, not A
+  outcomes = () => new Promise((r) => (settle = r));
+  const t0 = Date.now();
+  const hung = mod.resyncSnapshot(LANG, {}, { deadlineMs: 100 });
+  hung.catch(() => {});
+  const res = await Promise.race([
+    hung.then(
+      () => "resolved",
+      (e: Error) => `rejected: ${e.message}`
+    ),
+    sleep(1000).then(() => "pending"),
+  ]);
+  assert.match(res, /^rejected: .*deadline/, `snapshot with a hung collection: ${res} after 1 s`);
+  assert.ok(Date.now() - t0 < 500, `rejected only after ${Date.now() - t0} ms`);
+
+  // a second snapshot meanwhile reuses the hung call (no duplicate) and
+  // also gives up at its deadline
+  await assert.rejects(mod.resyncSnapshot(LANG, {}, { deadlineMs: 50 }), /deadline/);
+  assert.equal(outcomeCalls, 2, "a second host call started for the hung collection");
+
+  // the hung call settles late: A absent, B present — none of it applies
+  settle!([outcomeB()]);
+  await sleep(20);
+  assert.ok(!mod.mountState.entries.has(B), "the abandoned snapshot's late data was applied");
+  assert.equal(strikes(A), 0, "the abandoned snapshot's late absence counted a strike");
+
+  // once settled, a new snapshot starts a fresh call and succeeds
+  outcomes = async () => [outcomeA()];
+  await mod.resyncSnapshot(LANG, {}, { deadlineMs: 100 });
+  assert.equal(outcomeCalls, 3);
+  assert.ok(mod.mountState.entries.has(A));
+  assert.ok(!mod.mountState.entries.has(B));
+});

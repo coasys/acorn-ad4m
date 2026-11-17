@@ -29,6 +29,15 @@ const NICK = "projects";
 const FETCH_ALL = { input: { All: null }, local: true };
 const FETCH_NONE = { input: null, local: true };
 
+// Every full snapshot's reads are deadlined (Lal round 5, P2): a host call
+// that never settles stays pooled (pool.ts — no second call for that
+// collection), but the snapshot waiting on it rejects at the deadline
+// instead of holding its caller (mountSnapshot, the periodic and overflow
+// resyncs, unknown-address refreshes, the write paths) forever. 15 s: a
+// local read of ~500 outcomes takes ~1 s on the rig; under the overflow
+// resync's own 30 s deadline.
+export const SNAPSHOT_DEADLINE_MS = 15000;
+
 function isNoProjectMeta(e: unknown): boolean {
   return String((e as Error)?.message ?? e)
     .toLowerCase()
@@ -46,15 +55,22 @@ function isNoProjectMeta(e: unknown): boolean {
 // `complete: false` marks a read whose absences must not count toward
 // removal (the worker's overflow fallback — Lal round 3, F1); a `fence`
 // that turned stale while reading (the worker's deadline passed — F3)
-// makes the read apply nothing. A read reusing an older pooled call is
+// makes the read apply nothing. Reads that miss the deadline (`deadlineMs`,
+// default SNAPSHOT_DEADLINE_MS) reject before ANY application: the merge
+// below runs synchronously after the reads, so an abandoned snapshot can
+// never apply data or absence strikes when its calls settle later. A read reusing an older pooled call is
 // ordered by the OLDEST call it used (seq and start time). Answers the
 // whole mount after the merge plus the delta the merge made.
 export async function resyncSnapshot(
   lang: string,
   own: SnapshotIdentity = {},
-  opts: { complete?: boolean; fence?: { stale(): boolean } } = {}
+  opts: { complete?: boolean; fence?: { stale(): boolean }; deadlineMs?: number } = {}
 ): Promise<{ entries: SnapshotEntry[]; delta: MountDelta; seq: number }> {
-  const { others, outcomes, ctx, seq, startedAt } = await readSnapshot(lang, own);
+  const { others, outcomes, ctx, seq, startedAt } = await readSnapshot(
+    lang,
+    own,
+    opts.deadlineMs ?? SNAPSHOT_DEADLINE_MS
+  );
   if (opts.fence?.stale()) {
     // the worker gave up on this (overflow) read: it applies nothing
     return { entries: mountState.list(), delta: { changed: [], removed: [] }, seq };
@@ -95,9 +111,10 @@ export async function resyncSnapshot(
 
 export async function takeSnapshot(
   lang: string,
-  own: SnapshotIdentity = {}
+  own: SnapshotIdentity = {},
+  opts: { deadlineMs?: number } = {}
 ): Promise<{ entries: SnapshotEntry[] }> {
-  const { entries } = await resyncSnapshot(lang, own);
+  const { entries } = await resyncSnapshot(lang, own, opts);
   return { entries };
 }
 
@@ -129,7 +146,8 @@ function pooled(
 // `seq`/`startedAt` are those of the oldest call read.
 async function readSnapshot(
   lang: string,
-  own: SnapshotIdentity
+  own: SnapshotIdentity,
+  deadlineMs: number
 ): Promise<{
   others: SnapshotEntry[];
   outcomes: any[];
@@ -153,7 +171,7 @@ async function readSnapshot(
     projectMeta,
     members,
     profiles,
-  ] = await Promise.all([
+  ] = await withDeadline(deadlineMs, [
     read("projects", "fetch_outcomes", FETCH_ALL),
     read("projects", "fetch_connections", FETCH_ALL),
     read("projects", "fetch_entry_points", FETCH_ALL),
@@ -166,7 +184,7 @@ async function readSnapshot(
     read("projects", "fetch_members", FETCH_NONE),
     // fetch_agents returns bare Profiles (no WireRecord) — Correction 6.
     read("profiles", "fetch_agents", FETCH_NONE),
-  ]);
+  ] as const);
   const seq = Math.min(...used.map((c) => c.seq));
   const startedAt = Math.min(...used.map((c) => c.startedAt));
 
@@ -195,4 +213,27 @@ async function readSnapshot(
   for (const p of profiles ?? []) push("AcornProfile", p);
 
   return { others, outcomes: outcomes ?? [], ctx, seq, startedAt };
+}
+
+// Promise.all over the reads, rejected once `ms` pass. The timer is
+// cleared when the reads finish first; the reads themselves are not
+// cancelled (they cannot be) and stay pooled until they settle.
+async function withDeadline<T extends readonly unknown[]>(
+  ms: number,
+  reads: T
+): Promise<{ -readonly [K in keyof T]: Awaited<T[K]> }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.all(reads),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`acorn snapshot: reads missed the ${ms} ms deadline`)),
+          ms
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
