@@ -14,6 +14,7 @@ import assert from "node:assert/strict";
 import { agentToDid } from "../../src/agent";
 import { toData, type MapCtx } from "../../src/mapping";
 import {
+  _resetCommittedForTests,
   createRecord,
   updateRecord,
   type WriteCtx,
@@ -33,6 +34,8 @@ import {
   uncertainOutcomeEntry,
   wireRecord,
 } from "./fixtures";
+
+test.beforeEach(() => _resetCommittedForTests());
 
 const OUTCOME_C = "uhCkkT3V0Y29tZUMuLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi5sb2Mh";
 
@@ -107,12 +110,19 @@ test("repeated identical create returns the same mounted address twice", async (
   const r1 = await createRecord(
     "AcornTag",
     params,
-    ctx({ call: async () => first, snapshot: async () => snap })
+    ctx({
+      call: async (_z, fn) => (fn === "fetch_tags" ? [] : first),
+      snapshot: async () => snap,
+    })
   );
+  // the second preflight lists the first record: no second commit
   const r2 = await createRecord(
     "AcornTag",
     params,
-    ctx({ call: async () => second, snapshot: async () => snap })
+    ctx({
+      call: async (_z, fn) => (fn === "fetch_tags" ? [first] : second),
+      snapshot: async () => snap,
+    })
   );
   assert.equal(r1.address, TAG_T);
   assert.equal(r2.address, TAG_T);
@@ -307,4 +317,78 @@ test("outcome update returns just the outcome (no derived fields move)", async (
     res.changed.map((e) => e.address),
     [OUTCOME_A]
   );
+});
+
+// ---- create: a failed/incomplete preflight is no licence to commit ---------
+// (Lal round 3, F4)
+
+const tagParams = { text: "urgent", backgroundColor: "#112233" };
+
+test("failed preflight read rejects and commits nothing", async () => {
+  let creates = 0;
+  await assert.rejects(
+    createRecord(
+      "AcornTag",
+      tagParams,
+      ctx({
+        call: async (_z, fn) => {
+          if (fn === "fetch_tags") throw new Error("source chain read timed out");
+          creates++;
+          return {};
+        },
+      })
+    ),
+    /preflight/
+  );
+  assert.equal(creates, 0);
+});
+
+test("concurrent identical creates with a failing second preflight commit once", async () => {
+  const wr = { ...wireRecord(tagEntry(), { actionHash: TAG_T }), entryHash: ENTRY_HASH };
+  let committed = false;
+  let creates = 0;
+  let preflights = 0;
+  const c = ctx({
+    call: async (_z, fn) => {
+      if (fn === "fetch_tags") {
+        if (++preflights === 2) throw new Error("read failed");
+        return committed ? [wr] : [];
+      }
+      creates++;
+      committed = true;
+      return wr;
+    },
+    snapshot: async () => ({ entries: committed ? [snapEntry("AcornTag", wr)] : [] }),
+  });
+  const res = await Promise.allSettled([
+    createRecord("AcornTag", tagParams, c),
+    createRecord("AcornTag", tagParams, c),
+  ]);
+  assert.equal(creates, 1, "committed twice");
+  assert.equal(res[0].status, "fulfilled");
+  if (res[1].status === "fulfilled") assert.equal(res[1].value.address, TAG_T);
+});
+
+test("an incomplete second preflight (omits our own commit) never commits twice", async () => {
+  // the second read succeeds but does not list the record this language
+  // committed a moment ago — the identity we retained says it exists.
+  const wr = { ...wireRecord(tagEntry(), { actionHash: TAG_T }), entryHash: ENTRY_HASH };
+  let creates = 0;
+  const c = ctx({
+    call: async (_z, fn) => {
+      if (fn === "fetch_tags") return [];
+      creates++;
+      return wr;
+    },
+    snapshot: async () => ({ entries: [snapEntry("AcornTag", wr)] }),
+  });
+  const r1 = await createRecord("AcornTag", tagParams, c);
+  assert.equal(r1.address, TAG_T);
+  const r2 = await createRecord("AcornTag", tagParams, c).then(
+    (v) => v,
+    (e) => e
+  );
+  assert.equal(creates, 1, "committed twice");
+  if (!(r2 instanceof Error)) assert.equal(r2.address, TAG_T);
+  else assert.match(r2.message, /preflight|already committed/);
 });

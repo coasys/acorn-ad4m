@@ -429,9 +429,12 @@ async function createLocked(
       const entry = toEntry(className, createData(className, p, ctx), mctx);
       const same =
         className !== "AcornProfile" && fns.fetch
-          ? await identicalRecord(ctx, fns.zome, fns.fetch, entry)
+          ? await identicalRecord(ctx, className, fns.zome, fns.fetch, entry)
           : null;
       const wr = same ?? (await ctx.call(fns.zome, fns.create!, entry));
+      if (!same && className !== "AcornProfile") {
+        rememberCommitted(ctx, className, entry, wr);
+      }
       if (className === "AcornProfile") {
         // a profile mounts under its author key, not an action hash
         profileAddress = `profile/${entry.agentPubKey}`;
@@ -490,11 +493,56 @@ async function createLocked(
   }
 }
 
-// The already-existing record whose entry equals `entry`, from a local
-// read of the class's collection, as {actionHash, entryHash}; null when
-// none (or the read fails — the create then commits as before).
+// Identities this language committed recently (Lal round 3, F4), keyed
+// by lang + class + canonical entry: an identical create that runs while
+// the preflight read does not (yet) show our own commit must not commit a
+// second action. Bounded and time-limited; deleteRecord drops entries for
+// the address it deletes. A remote delete of such a record makes an
+// identical re-create here fail (not duplicate) until the entry expires.
+const COMMITTED_TTL_MS = 10 * 60 * 1000;
+const COMMITTED_MAX = 1000;
+const committedIds = new Map<
+  string,
+  { at: number; actionHash: string; entryHash?: unknown }
+>();
+
+function committedKey(ctx: WriteCtx, className: string, entry: unknown): string {
+  return `${ctx.lang}\u0000${className}\u0000${canonJson(entry)}`;
+}
+
+function rememberCommitted(
+  ctx: WriteCtx,
+  className: string,
+  entry: unknown,
+  wr: { actionHash?: unknown; entryHash?: unknown } | null | undefined
+) {
+  if (typeof wr?.actionHash !== "string") return;
+  const key = committedKey(ctx, className, entry);
+  committedIds.delete(key);
+  committedIds.set(key, { at: Date.now(), actionHash: wr.actionHash, entryHash: wr.entryHash });
+  while (committedIds.size > COMMITTED_MAX) {
+    committedIds.delete(committedIds.keys().next().value!);
+  }
+}
+
+function forgetCommitted(address: string) {
+  for (const [k, v] of committedIds) if (v.actionHash === address) committedIds.delete(k);
+}
+
+/** test hook: forget every retained commit identity */
+export function _resetCommittedForTests() {
+  committedIds.clear();
+}
+
+// Preflight for a create (B7 #4, Lal round 3 F4): the already-existing
+// record whose entry equals `entry`, from a local read of the class's
+// collection, as {actionHash, entryHash}; null when the read SUCCEEDED and
+// lists none. A failed read, a non-list answer, or a read that omits a
+// record this language committed with the same entry recently is NOT
+// permission to commit: it throws, and nothing is committed.
 async function identicalRecord(
   ctx: WriteCtx,
+  className: string,
   zome: string,
   fetchFn: string,
   entry: unknown
@@ -502,15 +550,33 @@ async function identicalRecord(
   let rows: unknown;
   try {
     rows = await ctx.call(zome, fetchFn, { input: { All: null }, local: true });
-  } catch {
-    return null;
+  } catch (e) {
+    throw new Error(
+      `create: preflight read ${fetchFn} failed (${msg(e)}); not committed — ` +
+        `an identical record may already exist. Retry the create.`
+    );
   }
-  if (!Array.isArray(rows)) return null;
+  if (!Array.isArray(rows)) {
+    throw new Error(
+      `create: preflight read ${fetchFn} answered no list; not committed — retry the create`
+    );
+  }
   const want = canonJson(entry);
   const hit = rows.find(
     (r: any) => typeof r?.actionHash === "string" && canonJson(r.entry) === want
   );
-  return hit ? { actionHash: hit.actionHash, entryHash: hit.entryHash } : null;
+  if (hit) return { actionHash: hit.actionHash, entryHash: hit.entryHash };
+  const key = committedKey(ctx, className, entry);
+  const mine = committedIds.get(key);
+  if (mine && Date.now() - mine.at < COMMITTED_TTL_MS) {
+    throw new Error(
+      `create: this language already committed an identical ${className} ` +
+        `(${mine.actionHash}) but the preflight read does not list it — ` +
+        `incomplete read or deleted elsewhere; not committing a duplicate`
+    );
+  }
+  if (mine) committedIds.delete(key);
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -628,6 +694,7 @@ export async function deleteRecord(
 ): Promise<MountDelta> {
   const fns = FNS[className];
   if (!fns?.del) throw new Error(`delete: ${className} has no delete`);
+  forgetCommitted(address);
 
   // Records whose mounted data changes when this one disappears: an
   // outcome's former parent (children loses it) and children (parent
