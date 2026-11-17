@@ -37,7 +37,7 @@ import {
   type Derived,
   type MapCtx,
 } from "./mapping";
-import type { SnapshotEntry } from "./snapshot";
+import type { SnapshotEntry } from "./state";
 
 export interface MountDelta {
   address?: string;

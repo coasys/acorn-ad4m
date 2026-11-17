@@ -6,20 +6,13 @@
 import { holochainCall } from "ad4m:host";
 import { agentToDid } from "./agent";
 import { addressOf, deriveRelations, toData, type MapCtx } from "./mapping";
+import {
+  lastSnapshot,
+  type SnapshotEntry,
+  type SnapshotIdentity,
+} from "./state";
 
 const NICK = "projects";
-
-export interface SnapshotEntry {
-  class: string;
-  address: string;
-  data: Record<string, unknown>;
-}
-
-/** address -> {class, data} of the last snapshot `mountSnapshot` returned. */
-export const lastSnapshot = new Map<
-  string,
-  { class: string; data: Record<string, unknown> }
->();
 
 const FETCH_ALL = { input: { All: null }, local: true };
 const FETCH_NONE = { input: null, local: true };
@@ -28,13 +21,6 @@ function isNoProjectMeta(e: unknown): boolean {
   return String((e as Error)?.message ?? e)
     .toLowerCase()
     .includes("no project meta");
-}
-
-/** Identity the snapshot needs beyond `lang`: the own agent key (whose
- *  member gets `sameAs`) and the AD4M DID it points to (Correction 15). */
-export interface SnapshotIdentity {
-  ownAgent?: string;
-  ad4mDid?: string;
 }
 
 export async function takeSnapshot(

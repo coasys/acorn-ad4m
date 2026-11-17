@@ -14,7 +14,8 @@ import {
 import { agentToDid } from "./agent";
 import { toData } from "./mapping";
 import { isClassName, mountShapesFor } from "./shapes";
-import { lastSnapshot, takeSnapshot } from "./snapshot";
+import { lastSnapshot } from "./state";
+import { takeSnapshot } from "./snapshot";
 import {
   decodeSignalEnvelope,
   signalToDelta,
@@ -215,11 +216,14 @@ async function projectWhoami(): Promise<any> {
 }
 
 function writeCtx(): WriteCtx {
+  const lang = languageAddress();
   return {
-    lang: languageAddress(),
+    lang,
     ownAgent: ownAgentKey(),
     ad4mDid: agentDid(),
     seed,
+    call: (zome, fn, payload) => holochainCall(NICK, zome, fn, payload),
+    snapshot: () => takeSnapshot(lang, snapshotIdentity()),
   };
 }
 

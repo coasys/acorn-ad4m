@@ -6,7 +6,6 @@
 // Zome call shapes are documented in zomes.md. Entries carry ActionHashB64 /
 // AgentPubKeyB64 strings end to end (no binary crossing).
 
-import { holochainCall } from "ad4m:host";
 import { agentToDid, didToAgent } from "./agent";
 import {
   mergeForUpdate,
@@ -15,10 +14,8 @@ import {
   type MapCtx,
   type ToEntryCtx,
 } from "./mapping";
-import { lastSnapshot, takeSnapshot, type SnapshotEntry } from "./snapshot";
+import { lastSnapshot, type SnapshotEntry } from "./state";
 import { isClassName, writablePropNames } from "./shapes";
-
-const NICK = "projects";
 
 /** What an interaction needs besides the caller's params. */
 export interface WriteCtx {
@@ -30,6 +27,11 @@ export interface WriteCtx {
   ad4mDid: string;
   /** the project network seed (template banner) */
   seed: string;
+  /** a zome call on the projects DNA — production wires
+   *  `holochainCall(NICK, …)`; the unit tests inject a table (B6). */
+  call: (zome: string, fn: string, payload: unknown) => Promise<any>;
+  /** a fresh mount snapshot — production wires `takeSnapshot`. */
+  snapshot: () => Promise<{ entries: SnapshotEntry[] }>;
 }
 
 interface MountDelta {
@@ -299,7 +301,7 @@ export async function createRecord(
               siblingOrder: typeof p.siblingOrder === "number" ? p.siblingOrder : 0,
             }
           : null;
-      const res = await holochainCall(NICK, fns.zome, fns.create, {
+      const res = await ctx.call(fns.zome, fns.create, {
         entry,
         maybeLinkedOutcome,
       });
@@ -311,7 +313,7 @@ export async function createRecord(
       }
     } else if (className === "AcornProjectMeta") {
       const entry = toEntry(className, createData(className, p, ctx), mctx);
-      const wr = await holochainCall(NICK, fns.zome, fns.create, {
+      const wr = await ctx.call(fns.zome, fns.create, {
         input: entry,
         local: true,
       });
@@ -333,7 +335,7 @@ export async function createRecord(
         throw new Error("AcornOutcomeMember needs a member did");
       }
       const entry = toEntry(className, createData(className, p, ctx), mctx);
-      const wr = await holochainCall(NICK, fns.zome, fns.create, entry);
+      const wr = await ctx.call(fns.zome, fns.create, entry);
       if (className === "AcornProfile") {
         address = `profile/${entry.agentPubKey}`;
       } else {
@@ -350,10 +352,7 @@ export async function createRecord(
     throw new Error(m.startsWith("create:") ? m : `create: ${m}`);
   }
 
-  const snap = await takeSnapshot(ctx.lang, {
-    ownAgent: ctx.ownAgent,
-    ad4mDid: ctx.ad4mDid,
-  });
+  const snap = await ctx.snapshot();
   return { address, changed: pickEntries(snap, touched), removed: [] };
 }
 
@@ -388,7 +387,7 @@ export async function updateRecord(
       if (address !== `profile/${ctx.ownAgent}`) {
         throw new Error("only the own profile can be updated");
       }
-      current = await holochainCall(NICK, fns.zome, "whoami", {
+      current = await ctx.call(fns.zome, "whoami", {
         input: null,
         local: true,
       });
@@ -398,7 +397,7 @@ export async function updateRecord(
       updateHash = current.actionHash;
     } else {
       const records =
-        (await holochainCall(NICK, fns.zome, fns.fetch, {
+        (await ctx.call(fns.zome, fns.fetch, {
           input: { All: null },
           local: true,
         })) ?? [];
@@ -429,7 +428,7 @@ export async function updateRecord(
   }
 
   try {
-    await holochainCall(NICK, fns.zome, fns.update, {
+    await ctx.call(fns.zome, fns.update, {
       entry,
       actionHash: updateHash,
     });
@@ -437,10 +436,7 @@ export async function updateRecord(
     throw new Error(`update: ${msg(e)}`);
   }
 
-  const snap = await takeSnapshot(ctx.lang, {
-    ownAgent: ctx.ownAgent,
-    ad4mDid: ctx.ad4mDid,
-  });
+  const snap = await ctx.snapshot();
   return { address, changed: pickEntries(snap, [address]), removed: [] };
 }
 
@@ -480,7 +476,7 @@ export async function deleteRecord(
       // delete_outcome_fully also removes the connections, members,
       // comments and entry points attached to the outcome — the mount's
       // `removed` must list every one (votes are not mounted).
-      const res = await holochainCall(NICK, fns.zome, fns.del, {
+      const res = await ctx.call(fns.zome, fns.del, {
         input: address,
         local: true,
       });
@@ -492,17 +488,14 @@ export async function deleteRecord(
         ...(res.deletedEntryPoints ?? []),
       ];
     } else {
-      await holochainCall(NICK, fns.zome, fns.del, address);
+      await ctx.call(fns.zome, fns.del, address);
       removed = [address];
     }
   } catch (e) {
     throw new Error(`delete: ${msg(e)}`);
   }
 
-  const snap = await takeSnapshot(ctx.lang, {
-    ownAgent: ctx.ownAgent,
-    ad4mDid: ctx.ad4mDid,
-  });
+  const snap = await ctx.snapshot();
   return {
     address,
     changed: pickEntries(
