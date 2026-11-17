@@ -443,6 +443,15 @@ export async function updateRecord(
     throw new Error(`update: ${label(className)} ${address} not found`);
   }
 
+  // B6, Lal P2: a connection update moves its endpoints — the OLD outcomes
+  // lose a parent/children edge and the NEW ones gain it, so both sides'
+  // mounted data changes. Capture the endpoints from the fetched current
+  // record before the write; the new ones come from the merged entry below.
+  const oldEnds =
+    className === "AcornConnection"
+      ? [current.entry?.parentActionHash, current.entry?.childActionHash]
+      : [];
+
   let entry: Record<string, unknown>;
   try {
     entry = mergeForUpdate(className, current.entry, params ?? {}, mapCtx(ctx));
@@ -469,8 +478,19 @@ export async function updateRecord(
     throw new Error(`update: ${msg(e)}`);
   }
 
+  const touched: unknown[] = [address];
+  if (className === "AcornConnection") {
+    touched.push(...oldEnds, entry.parentActionHash, entry.childActionHash);
+  }
   const snap = await ctx.snapshot();
-  return { address, changed: pickEntries(snap, [address]), removed: [] };
+  return {
+    address,
+    changed: pickEntries(
+      snap,
+      touched.filter((a): a is string => typeof a === "string")
+    ),
+    removed: [],
+  };
 }
 
 // ---------------------------------------------------------------------------

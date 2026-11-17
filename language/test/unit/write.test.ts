@@ -133,6 +133,73 @@ test("create keeps the returned hash when the snapshot has no entryHash match", 
 
 // ---- update: old + new connection endpoints (B6, Lal P2) -------------------
 
+test("connection update returns the connection plus old and new endpoints", async () => {
+  // Move CONNECTION_AB from OUTCOME_B to OUTCOME_C under the same parent
+  // OUTCOME_A. The synchronous delta must re-expand every outcome whose
+  // mounted parent/children changed: old child B and new child C (and the
+  // parent A if an end moved across parents — covered by the same rule).
+  const current = wireRecord(connectionEntry(), { actionHash: CONNECTION_AB });
+  const moved = wireRecord(
+    { ...connectionEntry(), childActionHash: OUTCOME_C },
+    { actionHash: CONNECTION_AB }
+  );
+  const outcomes = [OUTCOME_A, OUTCOME_B, OUTCOME_C].map((h) =>
+    snapEntry("AcornOutcome", wireRecord(uncertainOutcomeEntry(), { actionHash: h }))
+  );
+  const res = await updateRecord(
+    "AcornConnection",
+    CONNECTION_AB,
+    { child: url(OUTCOME_C) },
+    ctx({
+      call: async (_z, fn) => {
+        if (fn === "fetch_connections") return [current];
+        if (fn === "update_connection") return moved;
+        throw new Error(`unexpected zome call ${fn}`);
+      },
+      snapshot: async () => ({
+        entries: [snapEntry("AcornConnection", moved), ...outcomes],
+      }),
+    })
+  );
+  assert.deepEqual(
+    new Set(res.changed.map((e) => e.address)),
+    new Set([CONNECTION_AB, OUTCOME_A, OUTCOME_B, OUTCOME_C])
+  );
+});
+
+test("connection update to a new parent returns both old parents and the child", async () => {
+  // Re-parent CONNECTION_AB from OUTCOME_A to OUTCOME_C: old parent A and
+  // new parent C both change their `children`, child B keeps its `parent`
+  // edge but is still re-expanded — every affected outcome is in the delta.
+  const current = wireRecord(connectionEntry(), { actionHash: CONNECTION_AB });
+  const moved = wireRecord(
+    { ...connectionEntry(), parentActionHash: OUTCOME_C },
+    { actionHash: CONNECTION_AB }
+  );
+  const outcomes = [OUTCOME_A, OUTCOME_B, OUTCOME_C].map((h) =>
+    snapEntry("AcornOutcome", wireRecord(smallOutcomeEntry(), { actionHash: h }))
+  );
+  const res = await updateRecord(
+    "AcornConnection",
+    CONNECTION_AB,
+    { parent: url(OUTCOME_C) },
+    ctx({
+      call: async (_z, fn) => {
+        if (fn === "fetch_connections") return [current];
+        if (fn === "update_connection") return moved;
+        throw new Error(`unexpected zome call ${fn}`);
+      },
+      snapshot: async () => ({
+        entries: [snapEntry("AcornConnection", moved), ...outcomes],
+      }),
+    })
+  );
+  assert.deepEqual(
+    new Set(res.changed.map((e) => e.address)),
+    new Set([CONNECTION_AB, OUTCOME_A, OUTCOME_B, OUTCOME_C])
+  );
+});
+
 test("outcome update returns just the outcome (no derived fields move)", async () => {
   const current = wireRecord(uncertainOutcomeEntry(), { actionHash: OUTCOME_A });
   const renamed = wireRecord(
