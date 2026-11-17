@@ -15,12 +15,9 @@ import { agentToDid } from "./agent";
 import { toData } from "./mapping";
 import { isClassName, mountShapesFor } from "./shapes";
 import { lastSnapshot, mountState } from "./state";
-import { takeSnapshot } from "./snapshot";
-import {
-  decodeSignalEnvelope,
-  signalToDelta,
-  FETCH_SPEC,
-} from "./signals";
+import { resyncSnapshot, takeSnapshot } from "./snapshot";
+import { decodeSignalEnvelope, FETCH_SPEC, type FetchKind } from "./signals";
+import { Reconciler } from "./reconcile";
 import {
   createParameters,
   createRecord,
@@ -69,53 +66,47 @@ export function isPublic(): boolean {
 
 // B4: an Acorn remote signal becomes a mount delta (design §1.5). The
 // executor hands us { cell_id, zome_name, payload } with payload still
-// msgpack (test/fixtures/raw-signal.md); decode, verify against the zomes,
-// fold into the last snapshot, and push the delta — every perspective
-// mounting this language applies it (ad4m_signal_emitted's mountDelta
-// branch). B6: the signal is only an invalidation hint — `fetch` re-reads
-// the claimed collections through the same zome calls the snapshot uses,
-// so a forged or stale signal payload never reaches the mount. The
-// signal's own writes echo back through this path too (get_peers
-// includes the sender) and are a no-op: applying a delta is a diff.
+// msgpack (test/fixtures/raw-signal.md). B6/B7: the signal is only an
+// invalidation hint — it marks records dirty in the one Reconciler
+// (reconcile.ts), which re-reads them through the same zome calls the
+// snapshot uses, applies through the mount state's revision guard and
+// pushes `{ mountDelta }` — every perspective mounting this language
+// applies it (ad4m_signal_emitted's mountDelta branch). Our own writes
+// echo back through this path too (get_peers includes the sender) and
+// are a no-op: the guard drops a re-read identical to what is mounted.
 //
-// Signals are only verified once the first snapshot has run — before any
+// The worker only starts once the first snapshot has run — before any
 // mount there is nothing to invalidate, and the mount itself picks the
 // records up (a stock-side burst of hundreds of signals would otherwise
 // starve the runtime in fetch-verification).
 let hasMounted = false;
 
-// Verified-collection fetch for signal handlers: network get, with
-// in-flight dedup and a small freshness window — a burst of signals (or a
-// poll loop's retries) coalesces onto one zome read instead of one each.
-const fetchRowsCache = new Map<string, { t: number; rows: any[] }>();
-const fetchRowsInflight = new Map<string, Promise<any[]>>();
-const FETCH_ROWS_TTL_MS = 400;
-
-function fetchRows(kind: string): Promise<any[]> {
-  const hit = fetchRowsCache.get(kind);
-  if (hit && Date.now() - hit.t < FETCH_ROWS_TTL_MS) {
-    return Promise.resolve(hit.rows);
-  }
-  const pending = fetchRowsInflight.get(kind);
-  if (pending) return pending;
-  const spec = FETCH_SPEC[kind as keyof typeof FETCH_SPEC];
-  const p = holochainCall(NICK, spec.zome, spec.fn, {
+// Verified-collection read for the worker: a NETWORK get — a signal
+// routinely lands BEFORE gossip delivers the op; GetStrategy::Network
+// queries the DHT now (the snapshot's bulk reads stay local). The worker
+// fetches each collection once per pass, so no caching here.
+async function fetchRows(kind: FetchKind): Promise<any[]> {
+  const spec = FETCH_SPEC[kind];
+  const res = await holochainCall(NICK, spec.zome, spec.fn, {
     input: spec.input,
     local: false,
-  }).then(
-    (res) => {
-      fetchRowsInflight.delete(kind);
-      const rows = Array.isArray(res) ? res : res == null ? [] : [res];
-      fetchRowsCache.set(kind, { t: Date.now(), rows });
-      return rows;
-    },
-    (err) => {
-      fetchRowsInflight.delete(kind);
-      throw err;
-    }
-  );
-  fetchRowsInflight.set(kind, p);
-  return p;
+  });
+  return Array.isArray(res) ? res : res == null ? [] : [res];
+}
+
+// created on first use: languageAddress() is a host call
+let worker: Reconciler | null = null;
+function reconciler(): Reconciler {
+  worker ??= new Reconciler({
+    lang: languageAddress(),
+    state: mountState,
+    fetch: fetchRows,
+    emit: (delta) => emitSignal({ mountDelta: delta }),
+    resync: async () =>
+      (await resyncSnapshot(languageAddress(), snapshotIdentity())).delta,
+    identity: snapshotIdentity,
+  });
+  return worker;
 }
 
 export async function handleHolochainSignal(signal: any): Promise<void> {
@@ -123,24 +114,7 @@ export async function handleHolochainSignal(signal: any): Promise<void> {
     if (!hasMounted) return;
     const decoded = decodeSignalEnvelope(signal?.payload);
     if (!decoded) return;
-    // taken before any fetch: every read this hint makes is ordered after
-    // it, and the guard below compares against what is mounted on APPLY
-    const seq = mountState.beginRead();
-    const delta = await signalToDelta(decoded, {
-      lang: languageAddress(),
-      snapshot: lastSnapshot,
-      ownAgent: ownAgentKey(),
-      ad4mDid: agentDid(),
-      // Network get: a signal routinely lands BEFORE gossip delivers the
-      // op; GetStrategy::Network queries the DHT now, which is what keeps
-      // the verify ahead of the 15 s resync (the snapshot reads stay
-      // local — they are bulk polls, not confirmations).
-      fetch: fetchRows,
-    });
-    if (!delta) return;
-    const changed = mountState.applyChanged(delta.changed, seq);
-    if (changed.length === 0) return;
-    emitSignal({ mountDelta: { changed, removed: [] } });
+    reconciler().hint(decoded);
   } catch (e) {
     console.error("handleHolochainSignal:", e);
   }
@@ -160,7 +134,10 @@ function snapshotIdentity() {
 
 export async function mountSnapshot(): Promise<object> {
   const snap = await takeSnapshot(languageAddress(), snapshotIdentity());
-  hasMounted = true;
+  if (!hasMounted) {
+    hasMounted = true;
+    reconciler().start();
+  }
   return snap;
 }
 

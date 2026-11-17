@@ -3,8 +3,10 @@
 // from records fetched through the zomes (injected `ctx.fetch`), never
 // from the signal's own fields (Lal review P1). A claimed change that the
 // fetch cannot confirm produces no delta; a claimed delete produces
-// `removed` only when the fetch confirms the record is gone; a profile is
-// emitted only as fetched, for the agent key it claims.
+// nothing at all (B7, Lal round 2 P1 — no stock read proves a deletion);
+// a profile is emitted only as fetched, for the agent key it claims.
+// B7: signalToDelta runs one hint through a private Reconciler
+// (reconcile.ts) to completion.
 //
 // The decoded envelope fixtures are written from the Rust signal types
 // (happs/happ/zomes/projects/src/lib.rs:43-65, hdk_crud/src/signals.rs:80-86,
@@ -14,11 +16,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { agentToDid } from "../../src/agent";
 import { deriveRelations, toData, type MapCtx } from "../../src/mapping";
-import {
-  signalToDelta,
-  type FetchKind,
-  type SignalCtx,
-} from "../../src/signals";
+import type { FetchKind } from "../../src/signals";
+import { signalToDelta, type SignalCtx } from "../../src/reconcile";
 import {
   AGENT_A,
   AGENT_B,
