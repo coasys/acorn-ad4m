@@ -1,5 +1,12 @@
-// B4 signals -> mount deltas (spec/11-b4-signals.md). The decoded envelope
-// fixtures are written from the Rust signal types
+// B4 signals -> mount deltas (spec/11-b4-signals.md), B6 verification:
+// a signal is only an invalidation hint — the delta is built exclusively
+// from records fetched through the zomes (injected `ctx.fetch`), never
+// from the signal's own fields (Lal review P1). A claimed change that the
+// fetch cannot confirm produces no delta; a claimed delete produces
+// `removed` only when the fetch confirms the record is gone; a profile is
+// emitted only as fetched, for the agent key it claims.
+//
+// The decoded envelope fixtures are written from the Rust signal types
 // (happs/happ/zomes/projects/src/lib.rs:43-65, hdk_crud/src/signals.rs:80-86,
 // member/entry.rs:8-13, profiles/src/lib.rs:285-307) and the one signal
 // captured on the rig (test/fixtures/raw-signal.md).
@@ -7,7 +14,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { agentToDid } from "../../src/agent";
 import { deriveRelations, toData, type MapCtx } from "../../src/mapping";
-import { signalToDelta, type SignalCtx } from "../../src/signals";
+import {
+  signalToDelta,
+  type FetchKind,
+  type SignalCtx,
+} from "../../src/signals";
 import {
   AGENT_A,
   AGENT_B,
@@ -48,7 +59,22 @@ function mkSnapshot(recs: { class: string; rec: any }[]): SignalCtx["snapshot"] 
   return m;
 }
 
-const ctx = (snapshot: SignalCtx["snapshot"]): SignalCtx => ({ lang: LANG, snapshot });
+// A fetch that answers `table[kind]` for every poll — the verified side.
+const fetchOf =
+  (table: Partial<Record<FetchKind, any[]>>): SignalCtx["fetch"] =>
+  async (kind) =>
+    table[kind] ?? [];
+
+const ctx = (
+  snapshot: SignalCtx["snapshot"],
+  fetch?: SignalCtx["fetch"]
+): SignalCtx => ({
+  lang: LANG,
+  snapshot,
+  fetch: fetch ?? fetchOf({}),
+  confirmTries: 3,
+  confirmDelayMs: 1,
+});
 
 const outcomeA = () => wireRecord(smallOutcomeEntry(), { actionHash: OUTCOME_A });
 const outcomeB = () =>
@@ -56,15 +82,15 @@ const outcomeB = () =>
 const connAB = () =>
   wireRecord(connectionEntry(), { actionHash: CONNECTION_AB });
 
-test("Outcome create signal -> one changed AcornOutcome with mapped data", () => {
+test("Outcome create signal -> one changed AcornOutcome with mapped data", async () => {
   // shape of the raw signal in test/fixtures/raw-signal.md
   const rec = outcomeA();
-  const d = signalToDelta(
+  const d = await signalToDelta(
     {
       signalType: "Outcome",
       data: { entryType: "outcome", action: "create", data: rec },
     },
-    ctx(new Map())
+    ctx(new Map(), fetchOf({ outcomes: [rec] }))
   );
   assert.ok(d);
   assert.equal(d.removed.length, 0);
@@ -78,33 +104,101 @@ test("Outcome create signal -> one changed AcornOutcome with mapped data", () =>
   assert.equal(e.data.entryHash, ENTRY_HASH);
 });
 
-test("Outcome update signal -> changed AcornOutcome", () => {
-  const rec = { ...outcomeA(), entry: { ...outcomeA().entry, content: "renamed" } };
-  const d = signalToDelta(
+test("Outcome create signal the fetch cannot confirm -> null", async () => {
+  // the signal's own record is never a source: nothing fetched, nothing mounted
+  const rec = outcomeA();
+  const d = await signalToDelta(
     {
       signalType: "Outcome",
-      data: { entryType: "outcome", action: "update", data: rec },
+      data: { entryType: "outcome", action: "create", data: rec },
     },
-    ctx(new Map())
+    ctx(new Map(), fetchOf({ outcomes: [] }))
+  );
+  assert.equal(d, null);
+});
+
+test("Outcome update signal -> changed AcornOutcome from the fetch", async () => {
+  const entry = outcomeA().entry as Record<string, unknown>;
+  const fetched = { ...outcomeA(), entry: { ...entry, content: "renamed" } };
+  const d = await signalToDelta(
+    {
+      signalType: "Outcome",
+      data: { entryType: "outcome", action: "update", data: fetched },
+    },
+    ctx(new Map(), fetchOf({ outcomes: [fetched] }))
   );
   assert.equal(d?.changed[0]?.data.content, "renamed");
 });
 
-test("Outcome delete signal -> removed: [hash]", () => {
-  const d = signalToDelta(
+test("forged update signal emits the fetched record, not the claimed one", async () => {
+  // the signal claims content "HACKED" with a far-future updatedAt; the
+  // fetch keeps answering the real record — the delta must carry the
+  // fetched truth, never the claim.
+  const real = outcomeA();
+  const forged = {
+    ...outcomeA(),
+    updatedAt: 9999999999999999,
+    entry: { ...(outcomeA().entry as Record<string, unknown>), content: "HACKED" },
+  };
+  const d = await signalToDelta(
+    {
+      signalType: "Outcome",
+      data: { entryType: "outcome", action: "update", data: forged },
+    },
+    ctx(new Map(), fetchOf({ outcomes: [real] }))
+  );
+  assert.ok(d, "the fetched record still produces a (re-asserting) delta");
+  assert.equal(d.changed.length, 1);
+  assert.equal(d.changed[0].address, OUTCOME_A);
+  assert.equal(d.changed[0].data.content, "Write the spec");
+});
+
+test("forged update of a record that does not exist -> null", async () => {
+  const d = await signalToDelta(
+    {
+      signalType: "Outcome",
+      data: {
+        entryType: "outcome",
+        action: "update",
+        data: wireRecord(
+          { ...smallOutcomeEntry(), content: "ghost" },
+          { actionHash: "uhCkkTm90aGVyZS4uLi4uLi4uLi4uLi4uLi4uLi4uLi5sb2Mh" }
+        ),
+      },
+    },
+    ctx(new Map(), fetchOf({ outcomes: [outcomeA()] }))
+  );
+  assert.equal(d, null);
+});
+
+test("Outcome delete signal -> removed: [hash] once the fetch confirms it gone", async () => {
+  const d = await signalToDelta(
     {
       signalType: "Outcome",
       data: { entryType: "outcome", action: "delete", data: OUTCOME_A },
     },
-    ctx(new Map())
+    ctx(new Map(), fetchOf({ outcomes: [] }))
   );
   assert.ok(d);
   assert.equal(d.changed.length, 0);
   assert.deepEqual(d.removed, [OUTCOME_A]);
 });
 
-test("DeleteOutcomeFully -> outcome + 2 connections + 1 comment removed, parent changed", () => {
-  // Snapshot: P --connAB--> C --connXC--> X, plus a comment on C.
+test("forged delete of a record that still fetches -> null, nothing removed", async () => {
+  const snapshot = mkSnapshot([{ class: "AcornOutcome", rec: outcomeA() }]);
+  const d = await signalToDelta(
+    {
+      signalType: "Outcome",
+      data: { entryType: "outcome", action: "delete", data: OUTCOME_A },
+    },
+    ctx(snapshot, fetchOf({ outcomes: [outcomeA()] }))
+  );
+  assert.equal(d, null);
+});
+
+test("DeleteOutcomeFully -> outcome + 2 connections + 1 comment removed, parent changed", async () => {
+  // Snapshot: P --connAB--> C --connXC--> X, plus a comment on C. The
+  // delete took C, both connections and the comment; P and X fetch on.
   const outcomeX = () =>
     wireRecord(uncertainOutcomeEntry(), { actionHash: OUTCOME_X });
   const connXC = () =>
@@ -128,7 +222,7 @@ test("DeleteOutcomeFully -> outcome + 2 connections + 1 comment removed, parent 
     { class: "AcornConnection", rec: connXC() },
     { class: "AcornOutcomeComment", rec: comment() },
   ]);
-  const d = signalToDelta(
+  const d = await signalToDelta(
     {
       signalType: "DeleteOutcomeFully",
       data: {
@@ -144,7 +238,16 @@ test("DeleteOutcomeFully -> outcome + 2 connections + 1 comment removed, parent 
         },
       },
     },
-    ctx(snapshot)
+    ctx(
+      snapshot,
+      fetchOf({
+        outcomes: [outcomeA(), outcomeX()],
+        connections: [],
+        comments: [],
+        outcomeMembers: [],
+        entryPoints: [],
+      })
+    )
   );
   assert.ok(d);
   assert.deepEqual(
@@ -164,16 +267,53 @@ test("DeleteOutcomeFully -> outcome + 2 connections + 1 comment removed, parent 
   assert.ok(!("parent" in x.data), `X.parent still set: ${JSON.stringify(x.data)}`);
 });
 
-test("Member signal with snake-case entry_type -> changed AcornMember", () => {
+test("DeleteOutcomeFully only removes what the fetch confirms gone", async () => {
+  // the signal claims the connection and comment died with the outcome,
+  // but both still fetch — only the outcome itself is confirmed.
+  const comment = () =>
+    wireRecord(outcomeCommentEntry(), { actionHash: COMMENT_1 });
+  const d = await signalToDelta(
+    {
+      signalType: "DeleteOutcomeFully",
+      data: {
+        entryType: "delete_outcome_fully",
+        action: "delete",
+        data: {
+          outcomeActionHash: OUTCOME_B,
+          deletedConnections: [CONNECTION_AB],
+          deletedOutcomeMembers: [],
+          deletedOutcomeVotes: [],
+          deletedOutcomeComments: [COMMENT_1],
+          deletedEntryPoints: [],
+        },
+      },
+    },
+    ctx(
+      new Map(),
+      fetchOf({
+        outcomes: [],
+        connections: [connAB()],
+        comments: [comment()],
+        outcomeMembers: [],
+        entryPoints: [],
+      })
+    )
+  );
+  assert.ok(d);
+  assert.deepEqual(d.removed, [OUTCOME_B]);
+});
+
+test("Member signal with snake-case entry_type -> changed AcornMember", async () => {
   // MemberSignal serialises `entry_type` (no camelCase rename) and carries a
-  // bare Member, not a WireRecord — the address comes from the snapshot.
-  const snapshot = mkSnapshot([{ class: "AcornMember", rec: wireRecord(memberEntry(), { actionHash: MEMBER_1 }) }]);
-  const d = signalToDelta(
+  // bare Member, not a WireRecord — the member's mounted address comes from
+  // the fetched record's actionHash, not the signal.
+  const rec = wireRecord(memberEntry(), { actionHash: MEMBER_1 });
+  const d = await signalToDelta(
     {
       signalType: "Member",
       data: { entry_type: "member", action: "create", data: { agentPubKey: AGENT_A } },
     },
-    ctx(snapshot)
+    ctx(new Map(), fetchOf({ members: [rec] }))
   );
   assert.ok(d);
   assert.equal(d.changed.length, 1);
@@ -182,19 +322,19 @@ test("Member signal with snake-case entry_type -> changed AcornMember", () => {
   assert.equal(d.changed[0].data.agent, DID_A);
 });
 
-test("Member signal for an unknown agent -> null (left to the resync)", () => {
-  const d = signalToDelta(
+test("Member signal for an agent with no fetched member -> null", async () => {
+  const d = await signalToDelta(
     {
       signalType: "Member",
       data: { entry_type: "member", action: "create", data: { agentPubKey: AGENT_B } },
     },
-    ctx(new Map())
+    ctx(new Map(), fetchOf({ members: [wireRecord(memberEntry(), { actionHash: MEMBER_1 })] }))
   );
   assert.equal(d, null);
 });
 
-test("RealtimeInfo -> null", () => {
-  const d = signalToDelta(
+test("RealtimeInfo -> null", async () => {
+  const d = await signalToDelta(
     {
       signalType: "RealtimeInfo",
       data: {
@@ -209,9 +349,9 @@ test("RealtimeInfo -> null", () => {
   assert.equal(d, null);
 });
 
-test("EditingOutcome and OutcomeVote -> null", () => {
+test("EditingOutcome and OutcomeVote -> null", async () => {
   for (const signalType of ["EditingOutcome", "OutcomeVote"]) {
-    const d = signalToDelta(
+    const d = await signalToDelta(
       { signalType, data: { entryType: "x", action: "create", data: {} } },
       ctx(new Map())
     );
@@ -219,41 +359,48 @@ test("EditingOutcome and OutcomeVote -> null", () => {
   }
 });
 
-test("Connection create -> changed connection + both ends re-expanded", () => {
+test("Connection create -> changed connection + both ends re-expanded", async () => {
   const snapshot = mkSnapshot([
     { class: "AcornOutcome", rec: outcomeA() },
     { class: "AcornOutcome", rec: outcomeB() },
   ]);
-  const d = signalToDelta(
+  const conn = connAB();
+  const d = await signalToDelta(
     {
       signalType: "Connection",
-      data: { entryType: "connection", action: "create", data: connAB() },
+      data: { entryType: "connection", action: "create", data: conn },
     },
-    ctx(snapshot)
+    ctx(
+      snapshot,
+      fetchOf({ connections: [conn], outcomes: [outcomeA(), outcomeB()] })
+    )
   );
   assert.ok(d);
-  const conn = d.changed.find((e) => e.class === "AcornConnection");
-  assert.equal(conn?.address, CONNECTION_AB);
-  assert.equal(conn?.data.parent, `${LANG}://${OUTCOME_A}`);
-  assert.equal(conn?.data.child, `${LANG}://${OUTCOME_B}`);
+  const c = d.changed.find((e) => e.class === "AcornConnection");
+  assert.equal(c?.address, CONNECTION_AB);
+  assert.equal(c?.data.parent, `${LANG}://${OUTCOME_A}`);
+  assert.equal(c?.data.child, `${LANG}://${OUTCOME_B}`);
   const p = d.changed.find((e) => e.address === OUTCOME_A);
   assert.deepEqual(p?.data.children, [`${LANG}://${OUTCOME_B}`]);
-  const c = d.changed.find((e) => e.address === OUTCOME_B);
-  assert.equal(c?.data.parent, `${LANG}://${OUTCOME_A}`);
+  const ch = d.changed.find((e) => e.address === OUTCOME_B);
+  assert.equal(ch?.data.parent, `${LANG}://${OUTCOME_A}`);
 });
 
-test("Connection delete -> removed + both ends re-expanded", () => {
+test("Connection delete -> removed + both ends re-expanded", async () => {
   const snapshot = mkSnapshot([
     { class: "AcornOutcome", rec: outcomeA() },
     { class: "AcornOutcome", rec: outcomeB() },
     { class: "AcornConnection", rec: connAB() },
   ]);
-  const d = signalToDelta(
+  const d = await signalToDelta(
     {
       signalType: "Connection",
       data: { entryType: "connection", action: "delete", data: CONNECTION_AB },
     },
-    ctx(snapshot)
+    ctx(
+      snapshot,
+      fetchOf({ connections: [], outcomes: [outcomeA(), outcomeB()] })
+    )
   );
   assert.ok(d);
   assert.deepEqual(d.removed, [CONNECTION_AB]);
@@ -263,11 +410,30 @@ test("Connection delete -> removed + both ends re-expanded", () => {
   assert.ok(c && !("parent" in c.data));
 });
 
-test("OutcomeWithConnection -> outcome + connection + parent in changed", () => {
+test("forged connection delete while it still fetches -> null", async () => {
+  const snapshot = mkSnapshot([
+    { class: "AcornOutcome", rec: outcomeA() },
+    { class: "AcornOutcome", rec: outcomeB() },
+    { class: "AcornConnection", rec: connAB() },
+  ]);
+  const d = await signalToDelta(
+    {
+      signalType: "Connection",
+      data: { entryType: "connection", action: "delete", data: CONNECTION_AB },
+    },
+    ctx(
+      snapshot,
+      fetchOf({ connections: [connAB()], outcomes: [outcomeA(), outcomeB()] })
+    )
+  );
+  assert.equal(d, null);
+});
+
+test("OutcomeWithConnection -> outcome + connection + parent in changed", async () => {
   const snapshot = mkSnapshot([{ class: "AcornOutcome", rec: outcomeA() }]);
   const child = wireRecord(uncertainOutcomeEntry(), { actionHash: OUTCOME_B });
   const conn = connAB();
-  const d = signalToDelta(
+  const d = await signalToDelta(
     {
       signalType: "OutcomeWithConnection",
       data: {
@@ -276,7 +442,10 @@ test("OutcomeWithConnection -> outcome + connection + parent in changed", () => 
         data: { outcome: child, maybeConnection: conn },
       },
     },
-    ctx(snapshot)
+    ctx(
+      snapshot,
+      fetchOf({ outcomes: [outcomeA(), child], connections: [conn] })
+    )
   );
   assert.ok(d);
   const o = d.changed.find((e) => e.address === OUTCOME_B);
@@ -287,20 +456,34 @@ test("OutcomeWithConnection -> outcome + connection + parent in changed", () => 
   assert.deepEqual(p?.data.children, [`${LANG}://${OUTCOME_B}`]);
 });
 
-test("Agent (profiles zome) update -> changed profile at profile/<key>", () => {
-  const rec = {
-    actionHash: "uhCkkvHJvcm9maWxlLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi5sb2Mh",
-    entryHash: ENTRY_HASH,
-    entry: { ...profileEntry(), firstName: "NewName" },
-    createdAt: 1,
-    updatedAt: 2,
-  };
-  const d = signalToDelta(
+test("OutcomeWithConnection the fetch cannot confirm -> null", async () => {
+  const child = wireRecord(uncertainOutcomeEntry(), { actionHash: OUTCOME_B });
+  const d = await signalToDelta(
+    {
+      signalType: "OutcomeWithConnection",
+      data: {
+        entryType: "outcome_with_connection",
+        action: "create",
+        data: { outcome: child, maybeConnection: connAB() },
+      },
+    },
+    ctx(new Map(), fetchOf({ outcomes: [], connections: [] }))
+  );
+  assert.equal(d, null);
+});
+
+test("Agent (profiles zome) update -> changed profile at profile/<key>", async () => {
+  const fetched = { ...profileEntry(), firstName: "NewName" };
+  const d = await signalToDelta(
     {
       signalType: "Agent",
-      data: { entryType: "agent", action: "update", data: rec },
+      data: {
+        entryType: "agent",
+        action: "update",
+        data: wireRecord(fetched, { actionHash: "uhCkkvHJvcm9maWxlLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi5sb2Mh" }),
+      },
     },
-    ctx(new Map())
+    ctx(new Map(), fetchOf({ profiles: [fetched] }))
   );
   assert.ok(d);
   assert.equal(d.changed.length, 1);
@@ -309,18 +492,72 @@ test("Agent (profiles zome) update -> changed profile at profile/<key>", () => {
   assert.equal(d.changed[0].data.firstName, "NewName");
 });
 
-test("Tag create -> changed AcornTag", () => {
-  const rec = wireRecord({ backgroundColor: "#112233", text: "urgent" }, { actionHash: "uhCkkdGFnMS4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi5sb2Mh" });
-  const d = signalToDelta(
+test("forged profile signal emits the fetched profile, not the claimed one", async () => {
+  // the claim says AGENT_A's name is "Forged"; the fetch says "Stock" —
+  // the emitted profile must be the fetched one for the claimed key.
+  const d = await signalToDelta(
+    {
+      signalType: "Agent",
+      data: {
+        entryType: "agent",
+        action: "update",
+        data: wireRecord(
+          { ...profileEntry(), firstName: "Forged" },
+          { actionHash: "uhCkkvHJvcm9maWxlLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi5sb2Mh" }
+        ),
+      },
+    },
+    ctx(new Map(), fetchOf({ profiles: [profileEntry()] }))
+  );
+  assert.ok(d);
+  assert.equal(d.changed[0].address, `profile/${AGENT_A}`);
+  assert.equal(d.changed[0].data.firstName, "Stock");
+});
+
+test("profile signal for a key with no fetched profile -> null", async () => {
+  const d = await signalToDelta(
+    {
+      signalType: "Agent",
+      data: {
+        entryType: "agent",
+        action: "update",
+        data: wireRecord(
+          { ...profileEntry(), agentPubKey: AGENT_B },
+          { actionHash: "uhCkkvHJvcm9maWxlLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi5sb2Mh" }
+        ),
+      },
+    },
+    ctx(new Map(), fetchOf({ profiles: [profileEntry()] }))
+  );
+  assert.equal(d, null);
+});
+
+test("Tag create -> changed AcornTag", async () => {
+  const rec = wireRecord(
+    { backgroundColor: "#112233", text: "urgent" },
+    { actionHash: "uhCkkdGFnMS4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi5sb2Mh" }
+  );
+  const d = await signalToDelta(
     { signalType: "Tag", data: { entryType: "tag", action: "create", data: rec } },
-    ctx(new Map())
+    ctx(new Map(), fetchOf({ tags: [rec] }))
   );
   assert.equal(d?.changed[0]?.class, "AcornTag");
   assert.equal(d?.changed[0]?.data.text, "urgent");
 });
 
-test("malformed payloads -> null, never throw", () => {
+test("no fetch on the context -> null (a signal that cannot be verified)", async () => {
+  const d = await signalToDelta(
+    {
+      signalType: "Outcome",
+      data: { entryType: "outcome", action: "create", data: outcomeA() },
+    },
+    { lang: LANG, snapshot: new Map() } as unknown as SignalCtx
+  );
+  assert.equal(d, null);
+});
+
+test("malformed payloads -> null, never throw", async () => {
   for (const decoded of [null, undefined, {}, { signalType: 3 }, { signalType: "Outcome" }, { signalType: "Outcome", data: { action: "create" } }]) {
-    assert.equal(signalToDelta(decoded, ctx(new Map())), null, JSON.stringify(decoded));
+    assert.equal(await signalToDelta(decoded, ctx(new Map())), null, JSON.stringify(decoded));
   }
 });

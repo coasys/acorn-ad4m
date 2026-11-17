@@ -15,7 +15,11 @@ import { agentToDid } from "./agent";
 import { toData } from "./mapping";
 import { isClassName, mountShapesFor } from "./shapes";
 import { lastSnapshot, takeSnapshot } from "./snapshot";
-import { decodeSignalEnvelope, signalToDelta } from "./signals";
+import {
+  decodeSignalEnvelope,
+  signalToDelta,
+  FETCH_SPEC,
+} from "./signals";
 import {
   createParameters,
   createRecord,
@@ -64,18 +68,31 @@ export function isPublic(): boolean {
 
 // B4: an Acorn remote signal becomes a mount delta (design §1.5). The
 // executor hands us { cell_id, zome_name, payload } with payload still
-// msgpack (test/fixtures/raw-signal.md); decode, map, fold into the last
-// snapshot, and push the delta — every perspective mounting this language
-// applies it (ad4m_signal_emitted's mountDelta branch). The signal's own
-// writes echo back through this path too (get_peers includes the sender)
-// and are a no-op: applying a delta is a diff.
+// msgpack (test/fixtures/raw-signal.md); decode, verify against the zomes,
+// fold into the last snapshot, and push the delta — every perspective
+// mounting this language applies it (ad4m_signal_emitted's mountDelta
+// branch). B6: the signal is only an invalidation hint — `fetch` re-reads
+// the claimed collections through the same zome calls the snapshot uses,
+// so a forged or stale signal payload never reaches the mount. The
+// signal's own writes echo back through this path too (get_peers
+// includes the sender) and are a no-op: applying a delta is a diff.
 export async function handleHolochainSignal(signal: any): Promise<void> {
   try {
     const decoded = decodeSignalEnvelope(signal?.payload);
     if (!decoded) return;
-    const delta = signalToDelta(decoded, {
+    const delta = await signalToDelta(decoded, {
       lang: languageAddress(),
       snapshot: lastSnapshot,
+      ownAgent: ownAgentKey(),
+      ad4mDid: agentDid(),
+      fetch: async (kind) => {
+        const spec = FETCH_SPEC[kind];
+        const res = await holochainCall(NICK, spec.zome, spec.fn, {
+          input: spec.input,
+          local: true,
+        });
+        return Array.isArray(res) ? res : res == null ? [] : [res];
+      },
     });
     if (!delta) return;
     for (const e of delta.changed) {
