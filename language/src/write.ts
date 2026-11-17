@@ -9,6 +9,7 @@
 import { holochainCall } from "ad4m:host";
 import { agentToDid, didToAgent } from "./agent";
 import {
+  mergeForUpdate,
   toEntry,
   urlToHash,
   type MapCtx,
@@ -345,6 +346,73 @@ export async function createRecord(
 
   const snap = await takeSnapshot(ctx.lang);
   return { address, changed: pickEntries(snap, touched), removed: [] };
+}
+
+// ---------------------------------------------------------------------------
+// update = read-modify-write (design §3.3)
+// ---------------------------------------------------------------------------
+
+// Lower-cased class name minus the Acorn prefix, for `… not found` errors.
+function label(className: string): string {
+  const s = className.startsWith("Acorn") ? className.slice(5) : className;
+  return s.charAt(0).toLowerCase() + s.slice(1);
+}
+
+export async function updateRecord(
+  className: string,
+  address: string,
+  params: Record<string, unknown>,
+  ctx: WriteCtx
+): Promise<MountDelta> {
+  const fns = FNS[className];
+  if (!fns?.update || !fns.fetch) {
+    throw new Error(`update: ${className} has no update`);
+  }
+
+  // read the current entry — `All` + an actionHash match serves every class
+  let current: any;
+  try {
+    const records =
+      (await holochainCall(NICK, fns.zome, fns.fetch, {
+        input: { All: null },
+        local: true,
+      })) ?? [];
+    current = records.find((r: any) => r?.actionHash === address);
+  } catch (e) {
+    throw new Error(`update: ${msg(e)}`);
+  }
+  if (!current) {
+    throw new Error(`update: ${label(className)} ${address} not found`);
+  }
+
+  let entry: Record<string, unknown>;
+  try {
+    entry = mergeForUpdate(className, current.entry, params ?? {}, mapCtx(ctx));
+    if (className === "AcornOutcome") {
+      // the Acorn UI stamps every outcome update with the editing agent and
+      // moment().unix() — the two fields a full-entry compare must allow.
+      entry.editorAgentPubKey = ctx.ownAgent;
+      entry.timestampUpdated = nowSecs();
+    }
+    if (className === "AcornProjectMeta") {
+      // never derived from mounted data; keep the stored passphrase.
+      entry.passphrase = current.entry.passphrase;
+    }
+  } catch (e) {
+    throw new Error(`update: ${msg(e)}`);
+  }
+
+  try {
+    await holochainCall(NICK, fns.zome, fns.update, {
+      entry,
+      actionHash: address,
+    });
+  } catch (e) {
+    throw new Error(`update: ${msg(e)}`);
+  }
+
+  const snap = await takeSnapshot(ctx.lang);
+  return { address, changed: pickEntries(snap, [address]), removed: [] };
 }
 
 // ---------------------------------------------------------------------------

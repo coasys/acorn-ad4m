@@ -15,6 +15,8 @@ import { lastSnapshot, takeSnapshot } from "./snapshot";
 import {
   createParameters,
   createRecord,
+  updateParameters,
+  updateRecord,
   writeCaps,
   type WriteCtx,
 } from "./write";
@@ -189,6 +191,17 @@ export async function interactions(address: string): Promise<Interaction[]> {
     hit = lastSnapshot.get(address);
   }
   if (!hit) return [];
+  const caps = writeCaps(hit.class);
+  const ctx = writeCtx();
   const list: Interaction[] = [];
+  if (caps.update) {
+    list.push({
+      name: "update",
+      label: `Update ${hit.class.slice("Acorn".length)}`,
+      parameters: updateParameters(hit.class),
+      execute: (params: any) =>
+        updateRecord(hit.class, address, params ?? {}, ctx),
+    });
+  }
   return list;
 }
