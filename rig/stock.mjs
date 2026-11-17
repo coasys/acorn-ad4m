@@ -4,6 +4,7 @@
 //   node stock.mjs setup   -> install happ, clone cell with $SEED, profile + meta
 //   node stock.mjs info    -> {agent, dna} of the stock clone cell
 //   node stock.mjs members -> fetch_members on the stock side
+// Tests import connect()/createOutcome()/… and call them on the running rig.
 import {
   AdminWebsocket,
   AppWebsocket,
@@ -72,9 +73,104 @@ async function connectAppAndSign(cid) {
 const callZome = (app, cid, zome_name, fn_name, payload) =>
   app.callZome({ cell_id: cid, zome_name, fn_name, payload });
 
-const cmd = process.argv[2];
+// ---- exported API for rig tests -------------------------------------------
+// connect() opens a signed app ws on the stock clone cell from .run state.
+// h = { adminWs, app, cid, agent }; close it with closeStock(h).
 
-if (cmd === "setup") {
+export async function connect() {
+  const s = loadState();
+  const cid = [new Uint8Array(s.cellId[0]), new Uint8Array(s.cellId[1])];
+  const { adminWs, app } = await connectAppAndSign(cid);
+  return { adminWs, app, cid, agent: s.agentKeyB64, dna: s.dnaHashB64 };
+}
+
+export async function closeStock(h) {
+  try {
+    await h?.app?.client?.close();
+  } catch {}
+  try {
+    await h?.adminWs?.client?.close();
+  } catch {}
+}
+
+export const stockCall = (h, zome, fn, payload) =>
+  callZome(h.app, h.cid, zome, fn, payload);
+
+// A Small-scope outcome entry, the shape Acorn's UI writes.
+export function outcomeEntry(agent, content, over = {}) {
+  return {
+    content,
+    creatorAgentPubKey: agent,
+    editorAgentPubKey: null,
+    timestampCreated: Date.now(),
+    timestampUpdated: null,
+    scope: {
+      Small: { achievementStatus: "NotAchieved", targetDate: null, taskList: [] },
+    },
+    tags: [],
+    description: "",
+    isImported: false,
+    githubLink: "",
+    ...over,
+  };
+}
+
+// returns the WireRecord {actionHash, entryHash, entry, createdAt, updatedAt}
+export function createOutcome(h, content, over) {
+  return stockCall(h, "projects", "create_outcome", outcomeEntry(h.agent, content, over));
+}
+
+// `ExistingOutcomeAsParent` makes the existing outcome the parent and the new
+// one its child (projects/outcome/crud.rs:126-137).
+export async function createOutcomeUnder(h, parentActionHash, content, siblingOrder = 0) {
+  const res = await stockCall(h, "projects", "create_outcome_with_connection", {
+    entry: outcomeEntry(h.agent, content),
+    maybeLinkedOutcome: {
+      outcomeActionHash: parentActionHash,
+      relation: "ExistingOutcomeAsParent",
+      siblingOrder,
+    },
+  });
+  return res.outcome;
+}
+
+export function createTag(h, text, backgroundColor = "#fff2d8") {
+  return stockCall(h, "projects", "create_tag", { backgroundColor, text });
+}
+
+// update takes {entry: <new full Outcome>, actionHash: <stable address>}.
+// The WireRecord's actionHash is the create hash — the mount address does
+// not move on update.
+export function updateOutcome(h, actionHash, entry) {
+  return stockCall(h, "projects", "update_outcome", { entry, actionHash });
+}
+
+export function createComment(h, outcomeActionHash, content) {
+  return stockCall(h, "projects", "create_outcome_comment", {
+    outcomeActionHash,
+    content,
+    creatorAgentPubKey: h.agent,
+    unixTimestamp: Date.now(),
+    isImported: false,
+  });
+}
+
+// n plain outcomes, sequential (one ws); returns the action hashes.
+export async function createOutcomes(h, n, prefix = "perf") {
+  const hashes = [];
+  for (let i = 0; i < n; i++) {
+    const rec = await createOutcome(h, `${prefix} ${i}`);
+    hashes.push(rec.actionHash);
+  }
+  return hashes;
+}
+
+// ---- CLI -------------------------------------------------------------------
+
+const isMain = import.meta.url === `file://${process.argv[1]}`;
+const cmd = isMain ? process.argv[2] : null;
+
+if (isMain && cmd === "setup") {
   const adminWs = await admin();
   const agentKey = await adminWs.generateAgentPubKey();
   console.log("agent:", b64(agentKey));
@@ -146,11 +242,11 @@ if (cmd === "setup") {
   });
   console.log("project meta created");
   process.exit(0);
-} else if (cmd === "info") {
+} else if (isMain && cmd === "info") {
   const s = loadState();
   console.log(JSON.stringify({ agent: s.agentKeyB64, dna: s.dnaHashB64 }));
   process.exit(0);
-} else if (cmd === "members") {
+} else if (isMain && cmd === "members") {
   if (!existsSync(STATE)) throw new Error("no stock state — run setup first");
   const s = loadState();
   const cid = [new Uint8Array(s.cellId[0]), new Uint8Array(s.cellId[1])];
@@ -161,7 +257,7 @@ if (cmd === "setup") {
   });
   console.log(JSON.stringify(members.map((m) => b64(m.entry.agentPubKey))));
   process.exit(0);
-} else {
+} else if (isMain) {
   console.log("usage: setup|info|members");
   process.exit(1);
 }
