@@ -239,13 +239,16 @@ const FNS: Record<
     zome: "profiles",
     fetch: "fetch_agents",
     create: "create_whoami",
-    // update_whoami exists but is B5's own-key profile write.
+    // whoami is the update read: fetch_agents is bare Profiles, and only
+    // the own profile is writable (Correction 6).
+    update: "update_whoami",
   },
 };
 
 /** Which write interactions a class offers (create on `class/<Name>`,
- *  update/delete on its records). AcornMember is read-only; AcornProfile's
- *  update is B5, AcornProjectMeta has no destructor in the shapes. */
+ *  update/delete on its records). AcornMember is read-only; AcornProfile
+ *  updates only on profile/<own key> (gated in interactions()); and
+ *  AcornProjectMeta has no destructor in the shapes. */
 export function writeCaps(className: string): {
   create: boolean;
   update: boolean;
@@ -369,14 +372,31 @@ export async function updateRecord(
   }
 
   // read the current entry — `All` + an actionHash match serves every class
+  // except AcornProfile, whose address is profile/<key> and whose only
+  // writable record is the own one: whoami is its read (Correction 6).
   let current: any;
+  let updateHash = address;
   try {
-    const records =
-      (await holochainCall(NICK, fns.zome, fns.fetch, {
-        input: { All: null },
+    if (className === "AcornProfile") {
+      if (address !== `profile/${ctx.ownAgent}`) {
+        throw new Error("only the own profile can be updated");
+      }
+      current = await holochainCall(NICK, fns.zome, "whoami", {
+        input: null,
         local: true,
-      })) ?? [];
-    current = records.find((r: any) => r?.actionHash === address);
+      });
+      if (!current) {
+        throw new Error("no own profile — create one first");
+      }
+      updateHash = current.actionHash;
+    } else {
+      const records =
+        (await holochainCall(NICK, fns.zome, fns.fetch, {
+          input: { All: null },
+          local: true,
+        })) ?? [];
+      current = records.find((r: any) => r?.actionHash === address);
+    }
   } catch (e) {
     throw new Error(`update: ${msg(e)}`);
   }
@@ -404,7 +424,7 @@ export async function updateRecord(
   try {
     await holochainCall(NICK, fns.zome, fns.update, {
       entry,
-      actionHash: address,
+      actionHash: updateHash,
     });
   } catch (e) {
     throw new Error(`update: ${msg(e)}`);

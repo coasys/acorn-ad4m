@@ -16,7 +16,7 @@ the correct choice on this full-arc rig.
 | AcornTag | `fetch_tags` | `create_tag(entry)` | `update_tag({ entry, actionHash })` | `delete_tag(actionHash)` |
 | AcornProjectMeta | `fetch_project_metas` (crud! plural) or `fetch_project_meta { input: null, local: true }` (custom, singular) → WireRecord | `simple_create_project_meta({ input: entry, local: true })` → WireRecord (refuses a second meta: `OnlyOneOfEntryType`) | `update_project_meta({ entry, actionHash })` | `delete_project_meta(actionHash)` (exists; not exposed — shape has no destructor) |
 | AcornMember | `fetch_members { input: null, local: true }` → `WireRecord[]` | — (created by `join_project` in B5) | — | — |
-| AcornProfile | `fetch_agents { input: null, local: true }` → bare `Profile[]` (no WireRecord) | `create_whoami(entry)` (zome `profiles`) → WireRecord | `update_whoami({ entry, actionHash })` (zome `profiles`; B5) | — |
+| AcornProfile | `fetch_agents { input: null, local: true }` → bare `Profile[]` (no WireRecord); update's read is `whoami` (same input) → `WireRecord \| null` | `create_whoami(entry)` (zome `profiles`) → WireRecord | `update_whoami({ entry, actionHash })` (zome `profiles`; only on `profile/<own key>`) | — |
 
 Notes:
 

@@ -225,7 +225,13 @@ export async function interactions(address: string): Promise<Interaction[]> {
   const caps = writeCaps(hit.class);
   const ctx = writeCtx();
   const list: Interaction[] = [];
-  if (caps.update) {
+  // AcornProfile: whoami/update_whoami only ever touch the caller's own
+  // profile, so `update` exists only on profile/<own key>; any other
+  // profile has no interactions (Correction 6).
+  const updatable =
+    caps.update &&
+    (hit.class !== "AcornProfile" || address === `profile/${ctx.ownAgent}`);
+  if (updatable) {
     list.push({
       name: "update",
       label: `Update ${hit.class.slice("Acorn".length)}`,
