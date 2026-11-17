@@ -62,14 +62,29 @@ export interface ReconcilerOpts {
   emit: (delta: MountDelta) => void;
   /** a full resync: read everything, merge through the state, answer the
    *  delta (overflow fallback) */
-  resync: () => Promise<MountDelta>;
+  resync: (fence: ResyncFence) => Promise<MountDelta>;
   /** own agent key + AD4M DID (the own member's sameAs) */
   identity?: () => { ownAgent?: string; ad4mDid?: string };
   maxPending?: number;
   budgetMs?: number;
   retryMs?: number;
   fetchTimeoutMs?: number;
+  /** host calls (collection reads) allowed outstanding until they SETTLE
+   *  — a timed-out call still counts (default 9, one per collection) */
+  maxOutstanding?: number;
+  /** deadline for the overflow resync (default 30 000 ms) */
+  overflowTimeoutMs?: number;
 }
+
+/** Handed to an overflow resync: `stale()` turns true once the worker
+ *  stopped waiting for it — its read must then not be applied. */
+export interface ResyncFence {
+  stale(): boolean;
+}
+
+const BACKOFF_MIN_MS = 1000;
+const BACKOFF_MAX_MS = 60000;
+const LIFETIME_BUDGETS = 3;
 
 interface Dirty extends HintTarget {
   key: string;
@@ -84,6 +99,9 @@ interface Dirty extends HintTarget {
   gen: number;
   /** 0 until the worker is started */
   deadline: number;
+  /** when the worker could first act on it: re-hints extend the deadline
+   *  to at most firstAt + 3 budgets (Lal round 3, F3) */
+  firstAt: number;
   nextAt: number;
 }
 
@@ -96,10 +114,21 @@ function num(v: unknown): number | undefined {
 const TIMED_OUT = Symbol("timed out");
 
 export class Reconciler {
-  readonly stats = { passes: 0, fetches: 0, resyncs: 0, overflows: 0, expired: 0 };
+  readonly stats = {
+    passes: 0,
+    fetches: 0,
+    resyncs: 0,
+    resyncFailures: 0,
+    dropped: 0,
+    overflows: 0,
+    expired: 0,
+  };
   private readonly queue = new Map<string, Dirty>();
   private started = false;
   private overflowPending = false;
+  /** hints may be dropped as covered by the owed resync — only until an
+   *  attempt at it fails (F3: a hung resync must not swallow all work) */
+  private dropCovered = false;
   /** MountState seq at the last hint the pending resync must cover */
   private overflowSeq = 0;
   private loop: Promise<void> | null = null;
@@ -107,12 +136,23 @@ export class Reconciler {
   private readonly budgetMs: number;
   private readonly retryMs: number;
   private readonly fetchTimeoutMs: number;
+  private readonly maxOutstanding: number;
+  private readonly overflowTimeoutMs: number;
+  /** collection reads started and not yet settled, with their read seq */
+  private readonly calls = new Map<FetchKind, { p: Promise<unknown>; seq: number }>();
+  /** the overflow resync started and not yet settled */
+  private resyncCall: Promise<unknown> | null = null;
+  private backoffMs = 0;
+  private resyncNotBefore = 0;
+  private wakeTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private readonly o: ReconcilerOpts) {
     this.maxPending = Math.max(1, o.maxPending ?? 256);
     this.budgetMs = Math.max(1, o.budgetMs ?? 13000);
     this.retryMs = Math.max(0, o.retryMs ?? 650);
     this.fetchTimeoutMs = Math.max(1, o.fetchTimeoutMs ?? 10000);
+    this.maxOutstanding = Math.max(1, o.maxOutstanding ?? 9);
+    this.overflowTimeoutMs = Math.max(1, o.overflowTimeoutMs ?? 30000);
   }
 
   /** dirty records waiting for the worker */
@@ -131,6 +171,7 @@ export class Reconciler {
     const now = Date.now();
     for (const d of this.queue.values()) {
       d.deadline = now + this.budgetMs;
+      d.firstAt = now;
       d.nextAt = now;
     }
     this.kick();
@@ -173,19 +214,28 @@ export class Reconciler {
         else d.updates++;
         d.want = Math.max(d.want, claimed);
         d.nextAt = now;
-        if (this.started) d.deadline = now + this.budgetMs;
+        if (this.started) {
+          d.deadline = Math.min(now + this.budgetMs, d.firstAt + LIFETIME_BUDGETS * this.budgetMs);
+        }
         continue;
       }
-      if (this.overflowPending) {
+      if (this.overflowPending && this.dropCovered) {
         // the pending resync covers it, if its read begins after this
         this.overflowSeq = this.o.state.beginRead();
         continue;
       }
       if (this.queue.size >= this.maxPending) {
-        this.queue.clear();
-        this.overflowPending = true;
-        this.overflowSeq = this.o.state.beginRead();
-        this.stats.overflows++;
+        if (!this.overflowPending) {
+          this.queue.clear();
+          this.overflowPending = true;
+          this.dropCovered = true;
+          this.overflowSeq = this.o.state.beginRead();
+          this.stats.overflows++;
+        } else {
+          // a resync is owed but failed/blocked: keep working the queue we
+          // have rather than trading it for a read that may never come
+          this.stats.dropped++;
+        }
         continue;
       }
       this.queue.set(key, {
@@ -197,33 +247,91 @@ export class Reconciler {
         want: claimed,
         gen: 0,
         deadline: this.started ? now + this.budgetMs : 0,
+        firstAt: now,
         nextAt: now,
       });
     }
     this.kick();
   }
 
+  /** may the overflow resync start now? one at a time, after backoff */
+  private resyncRunnable(): boolean {
+    return this.overflowPending && !this.resyncCall && Date.now() >= this.resyncNotBefore;
+  }
+
   private kick(): void {
     if (!this.started || this.loop) return;
-    if (!this.overflowPending && this.queue.size === 0) return;
+    if (!this.resyncRunnable() && this.queue.size === 0) {
+      // only a blocked resync is left: wake when its backoff ends (an
+      // in-flight one kicks us when it settles)
+      if (this.overflowPending && !this.resyncCall && !this.wakeTimer) {
+        this.wakeTimer = setTimeout(() => {
+          this.wakeTimer = null;
+          this.kick();
+        }, Math.max(1, this.resyncNotBefore - Date.now()));
+        // a retry chain alone must not keep a host process alive
+        (this.wakeTimer as any)?.unref?.();
+      }
+      return;
+    }
     this.loop = this.run().finally(() => {
       this.loop = null;
       this.kick(); // work that arrived as the loop was exiting
     });
   }
 
+  // The overflow fallback (F3): deadlined at overflowTimeoutMs; a read
+  // that misses it is fenced (its result is neither applied — the resync
+  // checks the fence — nor emitted), retried after an exponential backoff,
+  // and no second resync starts until the first has SETTLED.
+  private async overflowResync(): Promise<void> {
+    // cleared BEFORE the read: hints from here on are queued again
+    this.overflowPending = false;
+    this.stats.resyncs++;
+    let stale = false;
+    const fence: ResyncFence = { stale: () => stale };
+    let ok = false;
+    const call = Promise.resolve()
+      .then(() => this.o.resync(fence))
+      .then(
+        (d) => {
+          if (stale) return;
+          ok = true;
+          if (d.changed.length || d.removed.length) this.o.emit(d);
+        },
+        (e) => {
+          if (!stale) console.error("acorn reconcile: overflow resync failed:", e);
+        }
+      );
+    this.resyncCall = call;
+    call.finally(() => {
+      this.resyncCall = null;
+      this.kick();
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      call,
+      new Promise<void>((r) => {
+        timer = setTimeout(r, this.overflowTimeoutMs);
+      }),
+    ]);
+    clearTimeout(timer);
+    if (ok) {
+      this.backoffMs = 0;
+      return;
+    }
+    stale = true;
+    this.dropCovered = false;
+    this.stats.resyncFailures++;
+    this.backoffMs = Math.min(BACKOFF_MAX_MS, Math.max(BACKOFF_MIN_MS, this.backoffMs * 2));
+    this.resyncNotBefore = Date.now() + this.backoffMs;
+    this.overflowPending = true; // still owed
+  }
+
   private async run(): Promise<void> {
     for (;;) {
-      if (this.overflowPending) {
-        // cleared BEFORE the read: hints from here on are queued again
-        this.overflowPending = false;
-        this.stats.resyncs++;
-        try {
-          const d = await this.o.resync();
-          if (d.changed.length || d.removed.length) this.o.emit(d);
-        } catch (e) {
-          console.error("acorn reconcile: overflow resync failed:", e);
-        }
+      if (this.resyncRunnable()) {
+        await this.overflowResync();
         continue;
       }
       if (this.queue.size === 0) return;
@@ -246,20 +354,49 @@ export class Reconciler {
     }
   }
 
-  private async fetchBounded(kind: FetchKind, ms: number): Promise<any[] | null> {
-    this.stats.fetches++;
+  /** collection reads started and not yet settled */
+  get outstanding(): number {
+    return this.calls.size;
+  }
+
+  // One collection read, bounded (F3): a read of that collection still
+  // outstanding from an earlier pass (timed out but not settled) is
+  // awaited again instead of starting another host call; no new call
+  // starts while maxOutstanding are unsettled. Answers the rows (null =
+  // inconclusive) and the seq of the read actually used.
+  private async fetchBounded(
+    kind: FetchKind,
+    ms: number
+  ): Promise<{ rows: any[] | null; seq: number }> {
+    let call = this.calls.get(kind);
+    if (!call) {
+      if (this.calls.size >= this.maxOutstanding) return { rows: null, seq: 0 };
+      this.stats.fetches++;
+      const seq = this.o.state.beginRead();
+      const p = Promise.resolve().then(() => this.o.fetch(kind));
+      const c = { p, seq };
+      this.calls.set(kind, c);
+      p.then(
+        () => {},
+        () => {}
+      ).finally(() => {
+        if (this.calls.get(kind) === c) this.calls.delete(kind);
+      });
+      call = c;
+    }
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const res = await Promise.race([
-        this.o.fetch(kind),
+        call.p,
         new Promise<typeof TIMED_OUT>((r) => {
           timer = setTimeout(() => r(TIMED_OUT), ms);
         }),
       ]);
-      if (res === TIMED_OUT) return null;
-      return Array.isArray(res) ? res : res == null ? [] : [res];
+      if (res === TIMED_OUT) return { rows: null, seq: call.seq };
+      const rows = Array.isArray(res) ? res : res == null ? [] : [res];
+      return { rows, seq: call.seq };
     } catch {
-      return null; // inconclusive
+      return { rows: null, seq: call.seq }; // inconclusive
     } finally {
       clearTimeout(timer);
     }
@@ -273,12 +410,15 @@ export class Reconciler {
     const latest = Math.max(...due.map((d) => d.deadline));
     const ms = Math.max(1, Math.min(this.fetchTimeoutMs, latest - now));
 
-    const seq = this.o.state.beginRead();
-    const rows = new Map<FetchKind, any[] | null>(
-      await Promise.all(
-        [...kinds].map(async (k) => [k, await this.fetchBounded(k, ms)] as const)
-      )
+    // every read is applied at the OLDEST start seq among this pass's
+    // reads (a reused read may have started passes ago): older can only
+    // lose ties in the guard, never wrongly win them
+    const got = await Promise.all(
+      [...kinds].map(async (k) => [k, await this.fetchBounded(k, ms)] as const)
     );
+    const rows = new Map<FetchKind, any[] | null>(got.map(([k, r]) => [k, r.rows]));
+    const seqs = got.filter(([, r]) => r.rows).map(([, r]) => r.seq);
+    const seq = seqs.length ? Math.min(...seqs) : this.o.state.beginRead();
 
     // Lal round 3, F2: connections first, through the guard; then every
     // derived edge comes from the MOUNTED connections — a stale connection

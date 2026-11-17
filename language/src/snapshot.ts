@@ -40,16 +40,22 @@ function isNoProjectMeta(e: unknown): boolean {
 // failed to list keeps its edge until it is itself removed (F1). If the
 // removal pass drops a connection, the mounted outcomes are re-derived.
 // `complete: false` marks a read whose absences must not count toward
-// removal (the worker's overflow fallback — Lal round 3, F1). Answers the
+// removal (the worker's overflow fallback — Lal round 3, F1); a `fence`
+// that turned stale while reading (the worker's deadline passed — F3)
+// makes the read apply nothing. Answers the
 // whole mount after the merge plus the delta the merge made.
 export async function resyncSnapshot(
   lang: string,
   own: SnapshotIdentity = {},
-  opts: { complete?: boolean } = {}
+  opts: { complete?: boolean; fence?: { stale(): boolean } } = {}
 ): Promise<{ entries: SnapshotEntry[]; delta: MountDelta; seq: number }> {
   const seq = mountState.beginRead();
   const startedAt = Date.now();
   const { others, outcomes, ctx } = await readSnapshot(lang, own);
+  if (opts.fence?.stale()) {
+    // the worker gave up on this (overflow) read: it applies nothing
+    return { entries: mountState.list(), delta: { changed: [], removed: [] }, seq };
+  }
   const changed = new Map<string, SnapshotEntry>();
   const note = (es: SnapshotEntry[]) => es.forEach((e) => changed.set(e.address, e));
 

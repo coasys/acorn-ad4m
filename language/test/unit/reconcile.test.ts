@@ -250,3 +250,138 @@ test("overflow with a hint dropped DURING the init read still resyncs after init
   await idleWithin(r, 1000);
   assert.equal(resyncs(), 1);
 });
+
+// ---- bounded outstanding work (Lal round 3, F3) ----------------------------
+
+test("a hung overflow resync does not stall the worker (F3)", async () => {
+  const state = new MountState();
+  let resyncs = 0;
+  const later = outcome(addr(500), REV0);
+  const r = new Reconciler({
+    lang: LANG,
+    state,
+    fetch: async (kind: string) => (kind === "outcomes" ? [later] : []),
+    emit: () => {},
+    resync: () => {
+      resyncs++;
+      return new Promise(() => {}); // never settles
+    },
+    maxPending: 3,
+    budgetMs: 2000,
+    retryMs: 5,
+    overflowTimeoutMs: 30,
+  } as any);
+  r.start();
+  for (let i = 0; i < 10; i++) r.hint(hint("create", outcome(addr(i), REV0)));
+  await sleep(80);
+  r.hint(hint("create", later)); // ordinary work after the hung resync
+  const t0 = Date.now();
+  while (!state.entries.has(later.actionHash) && Date.now() - t0 < 1500) await sleep(10);
+  assert.ok(state.entries.has(later.actionHash), "worker stalled behind the hung resync");
+  assert.equal(resyncs, 1, "a second resync started while the first never settled");
+});
+
+test("a late overflow resync result is fenced off after its deadline (F3)", async () => {
+  let token: any = null;
+  const emitted: any[] = [];
+  const r = new Reconciler({
+    lang: LANG,
+    state: new MountState(),
+    fetch: async () => [],
+    emit: (d: any) => emitted.push(d),
+    resync: (fence: any) => {
+      token = fence;
+      return sleep(100).then(() => ({
+        changed: [{ class: "AcornOutcome", address: "LATE", data: {} }],
+        removed: [],
+      }));
+    },
+    maxPending: 2,
+    budgetMs: 50,
+    overflowTimeoutMs: 20,
+  } as any);
+  r.start();
+  for (let i = 0; i < 5; i++) r.hint(hint("create", outcome(addr(i), REV0)));
+  await sleep(200);
+  assert.ok(token && typeof token.stale === "function", "resync got no fence");
+  assert.equal(token.stale(), true, "timed-out resync not marked stale");
+  assert.equal(emitted.length, 0, "late resync delta emitted");
+});
+
+test("outstanding host calls stay at or below the cap across repeated timeouts (F3)", async () => {
+  let started = 0;
+  let maxOpen = 0;
+  let open = 0;
+  const r = new Reconciler({
+    lang: LANG,
+    state: new MountState(),
+    fetch: () => {
+      started++;
+      open++;
+      maxOpen = Math.max(maxOpen, open);
+      return new Promise(() => {}); // hung: never settles, so `open` never drops
+    },
+    emit: () => {},
+    resync: async () => ({ changed: [], removed: [] }),
+    budgetMs: 300,
+    retryMs: 1,
+    fetchTimeoutMs: 5,
+    maxOutstanding: 4,
+  } as any);
+  r.start();
+  for (let i = 0; i < 20; i++) r.hint(hint("create", outcome(addr(i), REV0)));
+  r.hint({
+    signalType: "Tag",
+    data: { entryType: "tag", action: "create", data: { actionHash: "uhCkkTAG1" } },
+  });
+  await idleWithin(r, 2000);
+  assert.ok(maxOpen <= 4, `outstanding calls reached ${maxOpen} (cap 4)`);
+  assert.ok(started <= 2, `${started} calls started for 2 hung collections`);
+});
+
+test("repeated bursts during a slow resync schedule at most one more (F3)", async () => {
+  let resyncs = 0;
+  const r = new Reconciler({
+    lang: LANG,
+    state: new MountState(),
+    fetch: async () => [],
+    emit: () => {},
+    resync: async () => {
+      resyncs++;
+      await sleep(60);
+      return { changed: [], removed: [] };
+    },
+    maxPending: 3,
+    budgetMs: 30,
+    retryMs: 1,
+  });
+  r.start();
+  for (let burst = 0; burst < 6; burst++) {
+    for (let i = 0; i < 10; i++) r.hint(hint("create", outcome(addr(burst * 100 + i), REV0)));
+    await sleep(5);
+  }
+  await idleWithin(r, 2000);
+  assert.ok(resyncs <= 2, `${resyncs} resyncs for bursts during one`);
+});
+
+test("re-hints cannot keep a record dirty forever (F3)", async () => {
+  const r = new Reconciler({
+    lang: LANG,
+    state: new MountState(),
+    fetch: async () => [],
+    emit: () => {},
+    resync: async () => ({ changed: [], removed: [] }),
+    budgetMs: 40,
+    retryMs: 2,
+  });
+  r.start();
+  // re-hinted every 10 ms for 300 ms: one dirty record may live at most
+  // 3x its budget (120 ms) from its first hint, so it must expire
+  const t0 = Date.now();
+  while (Date.now() - t0 < 300) {
+    r.hint(hint("update", outcome(OUTCOME_A, REV0)));
+    await sleep(10);
+  }
+  assert.ok(r.stats.expired >= 1, "re-hints kept one dirty record alive for 300 ms (budget 40)");
+  await idleWithin(r, 1000);
+});
