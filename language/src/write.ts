@@ -32,6 +32,11 @@ export interface WriteCtx {
   call: (zome: string, fn: string, payload: unknown) => Promise<any>;
   /** a fresh mount snapshot — production wires `takeSnapshot`. */
   snapshot: () => Promise<{ entries: SnapshotEntry[] }>;
+  /** post-commit reconciliation budget for a create: how long (wall
+   *  clock) to keep re-reading the snapshot for the committed record, and
+   *  the pause between reads (defaults 10 s / 500 ms). */
+  reconcileMs?: number;
+  reconcileDelayMs?: number;
 }
 
 interface MountDelta {
@@ -69,17 +74,65 @@ function pickEntries(
 // but fetch_* lists one record per ENTRY under the ORIGINAL create action
 // (get_latest_for_entry → details.actions.first()) — an identical
 // re-create answers an actionHash the mount never lists. Reconcile against
-// the fresh snapshot by entryHash (the mounted identity); the returned
-// hash stays only as the fallback while the record is not mounted yet.
+// the fresh snapshot by entryHash (the mounted identity). No match = not
+// mounted: null, never the raw hash (Lal round 2, #4).
 function mountedAddr(
   snap: { entries: SnapshotEntry[] },
   created: { actionHash: string; entryHash?: unknown }
-): string {
-  const hit =
-    typeof created.entryHash === "string"
-      ? snap.entries.find((e) => e.data?.entryHash === created.entryHash)
-      : null;
-  return hit?.address ?? created.actionHash;
+): string | null {
+  if (typeof created.entryHash === "string") {
+    const hit = snap.entries.find((e) => e.data?.entryHash === created.entryHash);
+    if (hit) return hit.address;
+  }
+  return snap.entries.some((e) => e.address === created.actionHash)
+    ? created.actionHash
+    : null;
+}
+
+// Key-order-insensitive JSON for comparing a would-be entry with a fetched
+// one (undefined fields dropped, as msgpack drops them).
+function canonJson(v: unknown): string {
+  return JSON.stringify(v, (_k, x) =>
+    x && typeof x === "object" && !Array.isArray(x)
+      ? Object.fromEntries(
+          Object.keys(x)
+            .sort()
+            .filter((k) => x[k] !== undefined)
+            .map((k) => [k, x[k]])
+        )
+      : x
+  );
+}
+
+// Creates are serialized per class (module-wide: every interaction's
+// WriteCtx shares it), so two concurrent identical creates cannot both
+// commit — the second sees the first's record in its pre-commit read.
+const createLocks = new Map<string, Promise<unknown>>();
+function serialized<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = createLocks.get(key) ?? Promise.resolve();
+  const run = prev.then(fn, fn);
+  const tail = run.catch(() => {});
+  createLocks.set(key, tail);
+  tail.then(() => {
+    if (createLocks.get(key) === tail) createLocks.delete(key);
+  });
+  return run;
+}
+
+/** A create committed on the DHT whose record the mount does not list
+ *  within the reconciliation budget. NOT retryable: the mutation already
+ *  happened — `committed` names its action hashes; the record mounts on
+ *  the next resync that lists it. */
+export class CommittedNotMountedError extends Error {
+  committed: string[];
+  constructor(committed: string[], ms: number, cause?: unknown) {
+    super(
+      `create: committed ${committed.join(", ")} but the mount does not ` +
+        `list it after ${ms} ms${cause ? ` (last read: ${msg(cause)})` : ""}; ` +
+        `do not retry the create — it mounts with the next resync`
+    );
+    this.committed = committed;
+  }
 }
 
 function msg(e: unknown): string {
@@ -302,7 +355,25 @@ export async function createRecord(
   }
   const fns = FNS[className];
   if (!fns?.create) throw new Error(`create: ${className} cannot be created`);
+  return serialized(className, () => createLocked(className, fns, params, ctx));
+}
 
+// Concurrent identical creates (Lal round 2, #4) — the defined behaviour:
+// creates of one class run one at a time; before committing, a class
+// whose entry carries no per-call stamp (tags, connections, …) reads its
+// collection and, when a record with a byte-identical entry already
+// exists, answers that record's mounted address WITHOUT a new commit. So
+// two identical creates from this agent yield one action and one stable
+// URL. Identical entries committed by OTHER agents still give one entry
+// several create actions; the mounted URL is then whichever action
+// fetch_* lists (details.actions.first()), and the URL an earlier create
+// answered can be replaced by another at a later resync.
+async function createLocked(
+  className: string,
+  fns: (typeof FNS)[string],
+  params: Record<string, unknown>,
+  ctx: WriteCtx
+): Promise<MountDelta> {
   const p = createParams(className, params ?? {});
   const mctx = mapCtx(ctx);
   const touched: string[] = [];
@@ -356,7 +427,11 @@ export async function createRecord(
         throw new Error("AcornOutcomeMember needs a member did");
       }
       const entry = toEntry(className, createData(className, p, ctx), mctx);
-      const wr = await ctx.call(fns.zome, fns.create, entry);
+      const same =
+        className !== "AcornProfile" && fns.fetch
+          ? await identicalRecord(ctx, fns.zome, fns.fetch, entry)
+          : null;
+      const wr = same ?? (await ctx.call(fns.zome, fns.create!, entry));
       if (className === "AcornProfile") {
         // a profile mounts under its author key, not an action hash
         profileAddress = `profile/${entry.agentPubKey}`;
@@ -373,20 +448,69 @@ export async function createRecord(
     throw new Error(m.startsWith("create:") ? m : `create: ${m}`);
   }
 
-  const snap = await ctx.snapshot();
-  const canonical = created.map((c) => mountedAddr(snap, c));
-  const address = profileAddress ?? canonical[0];
-  if (address == null) {
+  if (!profileAddress && !created.some((c) => c?.actionHash)) {
     throw new Error("create: the zome returned no record");
   }
-  return {
-    address,
-    changed: pickEntries(
-      snap,
-      [...(profileAddress ? [profileAddress] : canonical), ...touched]
-    ),
-    removed: [],
-  };
+
+  // Post-commit reconciliation: re-read the snapshot (never the mutation)
+  // until every committed record is mounted, within a wall-clock budget.
+  // A failed read is retried like a miss; on timeout the create rejects
+  // with CommittedNotMountedError — success is never reported with an
+  // address the mount does not list.
+  const budget = Math.max(0, ctx.reconcileMs ?? 10000);
+  const pause = Math.max(0, ctx.reconcileDelayMs ?? 500);
+  const t0 = Date.now();
+  let lastErr: unknown = null;
+  for (;;) {
+    try {
+      const snap = await ctx.snapshot();
+      const addrs = profileAddress
+        ? snap.entries.some((e) => e.address === profileAddress)
+          ? [profileAddress]
+          : [null]
+        : created.map((c) => mountedAddr(snap, c));
+      if (addrs.every((a): a is string => a != null)) {
+        return {
+          address: addrs[0],
+          changed: pickEntries(snap, [...addrs, ...touched]),
+          removed: [],
+        };
+      }
+      lastErr = null;
+    } catch (e) {
+      lastErr = e;
+    }
+    if (Date.now() - t0 >= budget) {
+      const committed = profileAddress
+        ? [profileAddress]
+        : created.map((c) => c.actionHash);
+      throw new CommittedNotMountedError(committed, Date.now() - t0, lastErr);
+    }
+    await new Promise((r) => setTimeout(r, pause));
+  }
+}
+
+// The already-existing record whose entry equals `entry`, from a local
+// read of the class's collection, as {actionHash, entryHash}; null when
+// none (or the read fails — the create then commits as before).
+async function identicalRecord(
+  ctx: WriteCtx,
+  zome: string,
+  fetchFn: string,
+  entry: unknown
+): Promise<{ actionHash: string; entryHash?: unknown } | null> {
+  let rows: unknown;
+  try {
+    rows = await ctx.call(zome, fetchFn, { input: { All: null }, local: true });
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(rows)) return null;
+  const want = canonJson(entry);
+  const hit = rows.find(
+    (r: any) => typeof r?.actionHash === "string" && canonJson(r.entry) === want
+  );
+  return hit ? { actionHash: hit.actionHash, entryHash: hit.entryHash } : null;
 }
 
 // ---------------------------------------------------------------------------

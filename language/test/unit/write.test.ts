@@ -81,6 +81,7 @@ test("create returns the canonical mounted address for a deduped entry", async (
     { text: "urgent", backgroundColor: "#112233" },
     ctx({
       call: async (_z, fn) => {
+        if (fn === "fetch_tags") return []; // pre-commit identical check
         assert.equal(fn, "create_tag");
         return dupe;
       },
@@ -117,18 +118,101 @@ test("repeated identical create returns the same mounted address twice", async (
   assert.equal(r2.address, TAG_T);
 });
 
-test("create keeps the returned hash when the snapshot has no entryHash match", async () => {
-  // Fallback: a record not yet in the snapshot (or one whose entryHash is
-  // not mounted — profiles aside, every WireRecord mounts entryHash) keeps
-  // the hash the zome answered rather than failing the create.
+// ---- create: never an unmounted URL (Lal round 2, P2 #4) -------------------
+
+test("create never reports an unmounted URL: no snapshot match rejects, create ran once", async () => {
+  // The record committed but the mount does not list it (yet): the
+  // interaction must NOT answer the raw action hash as if it were mounted,
+  // and must not replay the create — it rejects naming what was committed.
   const wr = { ...wireRecord(tagEntry(), { actionHash: TAG_T }), entryHash: ENTRY_HASH };
+  let creates = 0;
+  let snaps = 0;
+  await assert.rejects(
+    createRecord(
+      "AcornTag",
+      { text: "urgent", backgroundColor: "#112233" },
+      ctx({
+        call: async (_z, fn) => {
+          if (fn === "fetch_tags") return [];
+          assert.equal(fn, "create_tag");
+          creates++;
+          return wr;
+        },
+        snapshot: async () => {
+          snaps++;
+          return { entries: [] };
+        },
+        reconcileMs: 30,
+        reconcileDelayMs: 5,
+      })
+    ),
+    (e: any) => {
+      assert.match(e.message, /committed/);
+      assert.match(e.message, new RegExp(TAG_T));
+      assert.deepEqual(e.committed, [TAG_T]);
+      return true;
+    }
+  );
+  assert.equal(creates, 1, "the create was replayed");
+  assert.ok(snaps >= 2, `post-commit reconciliation re-read only ${snaps}x`);
+});
+
+test("a failing post-commit snapshot is re-read, never re-committed", async () => {
+  const wr = { ...wireRecord(tagEntry(), { actionHash: TAG_T }), entryHash: ENTRY_HASH };
+  let creates = 0;
+  let snaps = 0;
   const res = await createRecord(
     "AcornTag",
     { text: "urgent", backgroundColor: "#112233" },
-    ctx({ call: async () => wr, snapshot: async () => ({ entries: [] }) })
+    ctx({
+      call: async (_z, fn) => {
+        if (fn === "fetch_tags") return [];
+        creates++;
+        return wr;
+      },
+      snapshot: async () => {
+        if (++snaps === 1) throw new Error("snapshot read timed out");
+        return { entries: [snapEntry("AcornTag", wr)] };
+      },
+      reconcileMs: 1000,
+      reconcileDelayMs: 5,
+    })
   );
+  assert.equal(creates, 1);
   assert.equal(res.address, TAG_T);
-  assert.deepEqual(res.changed, []);
+  assert.deepEqual(res.changed.map((e) => e.address), [TAG_T]);
+});
+
+test("concurrent identical creates commit once and answer the same mounted URL", async () => {
+  // Two interactions create a byte-identical tag at the same time. They
+  // are serialized; the second finds the first's record (same entry) in a
+  // fresh read and answers its mounted address without a second commit —
+  // a second action would make fetch_tags' canonical pick unstable.
+  const wr = { ...wireRecord(tagEntry(), { actionHash: TAG_T }), entryHash: ENTRY_HASH };
+  let committed = false;
+  let creates = 0;
+  const c = ctx({
+    call: async (_z, fn) => {
+      if (fn === "fetch_tags") return committed ? [wr] : [];
+      assert.equal(fn, "create_tag");
+      creates++;
+      await new Promise((r) => setTimeout(r, 10));
+      committed = true;
+      return wr;
+    },
+    snapshot: async () => ({
+      entries: committed ? [snapEntry("AcornTag", wr)] : [],
+    }),
+  });
+  const params = { text: "urgent", backgroundColor: "#112233" };
+  const [r1, r2] = await Promise.all([
+    createRecord("AcornTag", params, c),
+    createRecord("AcornTag", params, c),
+  ]);
+  assert.equal(creates, 1, "identical concurrent creates committed twice");
+  assert.equal(r1.address, TAG_T);
+  assert.equal(r2.address, TAG_T);
+  assert.deepEqual(r2.changed.map((e) => e.address), [TAG_T]);
 });
 
 // ---- update: old + new connection endpoints (B6, Lal P2) -------------------
