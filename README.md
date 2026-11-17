@@ -100,7 +100,9 @@ machine.
 - `language/` — the AD4M language. `node build.mjs` bundles `src/` into
   `build/bundle.js` with the Acorn hApp embedded and the
   `//!@ad4m-template-variable` seed banner. `ACORN_DEBUG_CALL=1` adds a
-  generic `call` zome-call interaction for the rig tests.
+  generic `call` zome-call interaction for the rig tests;
+  `ACORN_TEST_BUILD=1` adds the `mountResync` switch rig b4 needs (a
+  production build always runs the periodic resync).
 - `language/vendor/acorn.happ` — the step-0 0.7.0 rebuild of Acorn's
   projects hApp (see `vendor/HAPP.md`: NOT the release DNA).
 - `rig/` — two-node test rig: local kitsune2 bootstrap + relay, a stock

@@ -172,8 +172,17 @@ test("warmup: the stock side lists the AD4M agent as a peer", async (t) => {
   t.diagnostic(`AD4M member visible to stock after ${Date.now() - t0} ms`);
 });
 
+// mountResync exists only in a TEST build (Lal round 3, F5):
+//   cd language && ACORN_TEST_BUILD=1 node build.mjs
 async function setResync(enabled) {
-  const res = await ad4m.interact(`${L}://project`, "mountResync", { enabled });
+  let res;
+  try {
+    res = await ad4m.interact(`${L}://project`, "mountResync", { enabled });
+  } catch (e) {
+    throw new Error(
+      `mountResync unavailable — b4 needs a test build (ACORN_TEST_BUILD=1 node build.mjs): ${e.message}`
+    );
+  }
   assert.deepEqual(res, { enabled }, `mountResync(${enabled}) answered ${JSON.stringify(res)}`);
 }
 

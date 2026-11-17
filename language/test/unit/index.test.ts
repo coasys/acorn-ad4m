@@ -8,7 +8,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { build } from "esbuild";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -51,6 +52,7 @@ async function loadLanguage(defines: Record<string, string> = {}): Promise<any> 
       ACORN_HAPP_B64: '""',
       ACORN_DEBUG_CALL: "false",
       ACORN_MOUNT_RESYNC: "true",
+      ACORN_TEST_BUILD: "false",
       ...defines,
     },
     plugins: [
@@ -162,10 +164,10 @@ function countingHost(host: Host) {
   return calls;
 }
 
-test("mountResync off: later mountSnapshots answer the mount without reading", async () => {
+test("test build — mountResync off: later mountSnapshots answer the mount without reading", async () => {
   const host: Host = { local: { outcomes: [outcomeA()] }, network: {}, emitted: [] };
   const calls = countingHost(host);
-  const lang = await loadLanguage();
+  const lang = await loadLanguage({ ACORN_TEST_BUILD: "true" });
   await lang.mountSnapshot();
   const project = await lang.interactions("project");
   const sw = project.find((i: any) => i.name === "mountResync");
@@ -182,10 +184,10 @@ test("mountResync off: later mountSnapshots answer the mount without reading", a
   assert.deepEqual(again.entries.map((e: any) => e.address), [OUTCOME_B]);
 });
 
-test("ACORN_MOUNT_RESYNC=off at build time starts with the resync off", async () => {
+test("test build — ACORN_MOUNT_RESYNC=off at build time starts with the resync off", async () => {
   const host: Host = { local: { outcomes: [outcomeA()] }, network: {}, emitted: [] };
   const calls = countingHost(host);
-  const lang = await loadLanguage({ ACORN_MOUNT_RESYNC: "false" });
+  const lang = await loadLanguage({ ACORN_MOUNT_RESYNC: "false", ACORN_TEST_BUILD: "true" });
   await lang.mountSnapshot(); // the first snapshot always reads
   const after = calls.local;
   assert.ok(after > 0);
@@ -194,4 +196,61 @@ test("ACORN_MOUNT_RESYNC=off at build time starts with the resync off", async ()
   assert.equal(calls.local, after);
   const sw = (await lang.interactions("project")).find((i: any) => i.name === "mountResync");
   assert.deepEqual(await sw?.execute({}), { enabled: false });
+});
+
+// ---- production builds ignore the switch (Lal round 3, F5) -----------------
+//
+// The resync is the only path that removes records; a caller of project
+// interactions must not be able to turn deletion recovery off in a
+// production bundle, and a build env var must not either.
+
+async function assertResyncAlwaysOn(lang: any, host: Host, calls: { local: number }) {
+  const project = await lang.interactions("project");
+  assert.equal(
+    project.find((i: any) => i.name === "mountResync"),
+    undefined,
+    "production build exposes mountResync"
+  );
+  await lang.mountSnapshot();
+  const before = calls.local;
+  host.local.outcomes = [];
+  await lang.mountSnapshot();
+  assert.ok(calls.local > before, "production build skipped the resync read");
+}
+
+test("production build (stub): no mountResync, ACORN_MOUNT_RESYNC=false ignored", async () => {
+  const host: Host = { local: { outcomes: [outcomeA()] }, network: {}, emitted: [] };
+  const calls = countingHost(host);
+  const lang = await loadLanguage({ ACORN_MOUNT_RESYNC: "false", ACORN_TEST_BUILD: "false" });
+  await assertResyncAlwaysOn(lang, host, calls);
+});
+
+test("production artifact: `ACORN_MOUNT_RESYNC=off node build.mjs` keeps the resync on", async () => {
+  const root = join(HERE, "..", "..");
+  const env = { ...process.env, ACORN_MOUNT_RESYNC: "off" };
+  delete (env as any).ACORN_TEST_BUILD;
+  delete (env as any).ACORN_DEBUG_CALL;
+  try {
+    execFileSync("node", ["build.mjs"], { cwd: root, env, stdio: "pipe" });
+    const src = readFileSync(join(root, "build", "bundle.js"), "utf8");
+    const dir = mkdtempSync(join(tmpdir(), "acorn-prod-"));
+    writeFileSync(join(dir, "host.mjs"), HOST_STUB);
+    const out = join(dir, "bundle.mjs");
+    writeFileSync(
+      out,
+      src
+        .replace('const seed = "";', 'const seed = "test-seed";')
+        .replace(/from\s*["']ad4m:host["']/g, `from ${JSON.stringify(join(dir, "host.mjs"))}`)
+    );
+    const host: Host = { local: { outcomes: [outcomeA()] }, network: {}, emitted: [] };
+    const calls = countingHost(host);
+    const lang = await import(pathToFileURL(out).href);
+    await assertResyncAlwaysOn(lang, host, calls);
+  } finally {
+    // leave the default production bundle behind
+    const clean = { ...process.env };
+    delete (clean as any).ACORN_MOUNT_RESYNC;
+    delete (clean as any).ACORN_TEST_BUILD;
+    execFileSync("node", ["build.mjs"], { cwd: root, env: clean, stdio: "pipe" });
+  }
 });

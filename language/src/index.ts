@@ -38,6 +38,7 @@ declare const seed: string;
 declare const ACORN_HAPP_B64: string;
 declare const ACORN_DEBUG_CALL: boolean;
 declare const ACORN_MOUNT_RESYNC: boolean;
+declare const ACORN_TEST_BUILD: boolean;
 
 export const name = "acorn";
 export const version = "0.0.1";
@@ -138,12 +139,12 @@ function snapshotIdentity() {
 // every call after the first answers the mount as the signal worker left
 // it, without reading the zomes — the executor's diff is then a no-op, so
 // nothing reaches the mount except pushed deltas and write answers.
-// Default from the build (ACORN_MOUNT_RESYNC=off node build.mjs), switched
-// at runtime by the `mountResync` project interaction. Note the resync is
-// also the only path that REMOVES records (signals.ts): with it off,
-// stock-side deletions do not reach the mount. The worker's own overflow
-// fallback still runs a full resync.
-let periodicResync = ACORN_MOUNT_RESYNC;
+// TEST BUILDS ONLY (ACORN_TEST_BUILD=1 node build.mjs; Lal round 3, F5):
+// the default comes from ACORN_MOUNT_RESYNC=off and the `mountResync`
+// project interaction switches it at runtime. The resync is the only path
+// that REMOVES records (state.ts), so a production bundle ignores both and
+// always resyncs — no caller can switch deletion recovery off.
+let periodicResync = ACORN_TEST_BUILD ? ACORN_MOUNT_RESYNC : true;
 
 export async function mountSnapshot(): Promise<object> {
   if (hasMounted && !periodicResync) return { entries: mountState.list() };
@@ -299,15 +300,6 @@ export async function interactions(address: string): Promise<Interaction[]> {
         },
       },
       {
-        name: "mountResync",
-        label: "Switch the periodic full resync on or off; answers the setting",
-        parameters: [{ name: "enabled", type: "boolean" }],
-        execute: async (p: any) => {
-          if (typeof p?.enabled === "boolean") periodicResync = p.enabled;
-          return { enabled: periodicResync };
-        },
-      },
-      {
         name: "announceJoin",
         label: "Signal project peers that we joined",
         parameters: [],
@@ -319,6 +311,17 @@ export async function interactions(address: string): Promise<Interaction[]> {
         },
       },
     ];
+    if (ACORN_TEST_BUILD) {
+      list.push({
+        name: "mountResync",
+        label: "Switch the periodic full resync on or off (test builds only)",
+        parameters: [{ name: "enabled", type: "boolean" }],
+        execute: async (p: any) => {
+          if (typeof p?.enabled === "boolean") periodicResync = p.enabled;
+          return { enabled: periodicResync };
+        },
+      });
+    }
     if (ACORN_DEBUG_CALL) {
       list.push({
         name: "call",
