@@ -57,17 +57,24 @@ async function signCreds(adminWs, cid) {
 
 async function connectAppAndSign(cid) {
   const adminWs = await admin();
-  await signCreds(adminWs, cid);
-  const issued = await adminWs.issueAppAuthenticationToken({
-    installed_app_id: APP_ID,
-  });
-  const s = loadState();
-  const app = await AppWebsocket.connect({
-    url: new URL(`ws://127.0.0.1:${s.appPort}`),
-    token: issued.token,
-    ...WS_OPTS,
-  });
-  return { adminWs, app };
+  try {
+    await signCreds(adminWs, cid);
+    const issued = await adminWs.issueAppAuthenticationToken({
+      installed_app_id: APP_ID,
+    });
+    const s = loadState();
+    const app = await AppWebsocket.connect({
+      url: new URL(`ws://127.0.0.1:${s.appPort}`),
+      token: issued.token,
+      ...WS_OPTS,
+    });
+    return { adminWs, app };
+  } catch (e) {
+    // A half-open connect leaks the admin ws, which keeps a test-file
+    // child process's event loop alive forever after its tests end.
+    try { await adminWs?.client?.close(); } catch {}
+    throw e;
+  }
 }
 
 const callZome = (app, cid, zome_name, fn_name, payload) =>
@@ -80,8 +87,19 @@ const callZome = (app, cid, zome_name, fn_name, payload) =>
 export async function connect() {
   const s = loadState();
   const cid = [new Uint8Array(s.cellId[0]), new Uint8Array(s.cellId[1])];
-  const { adminWs, app } = await connectAppAndSign(cid);
-  return { adminWs, app, cid, agent: s.agentKeyB64, dna: s.dnaHashB64 };
+  // Test files all call this at once when the suite spawns them together;
+  // a concurrent cold-start call can be refused — retry on a fresh socket.
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const { adminWs, app } = await connectAppAndSign(cid);
+      return { adminWs, app, cid, agent: s.agentKeyB64, dna: s.dnaHashB64 };
+    } catch (e) {
+      lastErr = e;
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
+  throw lastErr;
 }
 
 export async function closeStock(h) {
