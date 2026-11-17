@@ -8,7 +8,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { build } from "esbuild";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -45,32 +45,36 @@ async function loadLanguage(
   const stub = join(dir, "host.mjs");
   writeFileSync(stub, HOST_STUB);
   const out = join(dir, "index.mjs");
-  await build({
-    entryPoints: [entry],
-    bundle: true,
-    format: "esm",
-    platform: "neutral",
-    mainFields: ["module", "main"],
-    outfile: out,
-    banner: { js: 'const seed = "test-seed";' },
-    define: {
-      ACORN_HAPP_B64: '""',
-      ACORN_DEBUG_CALL: "false",
-      ACORN_MOUNT_RESYNC: "true",
-      ACORN_TEST_BUILD: "false",
-      ...defines,
-    },
-    plugins: [
-      {
-        name: "host-stub",
-        setup(b) {
-          b.onResolve({ filter: /^ad4m:host$/ }, () => ({ path: stub }));
-        },
+  try {
+    await build({
+      entryPoints: [entry],
+      bundle: true,
+      format: "esm",
+      platform: "neutral",
+      mainFields: ["module", "main"],
+      outfile: out,
+      banner: { js: 'const seed = "test-seed";' },
+      define: {
+        ACORN_HAPP_B64: '""',
+        ACORN_DEBUG_CALL: "false",
+        ACORN_MOUNT_RESYNC: "true",
+        ACORN_TEST_BUILD: "false",
+        ...defines,
       },
-    ],
-    logLevel: "silent",
-  });
-  return import(pathToFileURL(out).href);
+      plugins: [
+        {
+          name: "host-stub",
+          setup(b) {
+            b.onResolve({ filter: /^ad4m:host$/ }, () => ({ path: stub }));
+          },
+        },
+      ],
+      logLevel: "silent",
+    });
+    return await import(pathToFileURL(out).href);
+  } finally {
+    rmSync(dir, { recursive: true, force: true }); // loaded: the files can go
+  }
 }
 
 const COLLECTIONS: Record<string, string> = {
@@ -237,10 +241,11 @@ test("production artifact: `ACORN_MOUNT_RESYNC=off node build.mjs` keeps the res
   const env = { ...process.env, ACORN_MOUNT_RESYNC: "off" };
   delete (env as any).ACORN_TEST_BUILD;
   delete (env as any).ACORN_DEBUG_CALL;
+  let dir: string | undefined;
   try {
     execFileSync("node", ["build.mjs"], { cwd: root, env, stdio: "pipe" });
     const src = readFileSync(join(root, "build", "bundle.js"), "utf8");
-    const dir = mkdtempSync(join(tmpdir(), "acorn-prod-"));
+    dir = mkdtempSync(join(tmpdir(), "acorn-prod-"));
     writeFileSync(join(dir, "host.mjs"), HOST_STUB);
     const out = join(dir, "bundle.mjs");
     writeFileSync(
@@ -254,6 +259,7 @@ test("production artifact: `ACORN_MOUNT_RESYNC=off node build.mjs` keeps the res
     const lang = await import(pathToFileURL(out).href);
     await assertResyncAlwaysOn(lang, host, calls);
   } finally {
+    if (dir) rmSync(dir, { recursive: true, force: true });
     // leave the default production bundle behind
     const clean = { ...process.env };
     delete (clean as any).ACORN_MOUNT_RESYNC;
@@ -354,6 +360,7 @@ test("failed full reads with a hung sibling start no new call for it across retr
   const entry = join(dir, "entry.ts");
   writeFileSync(entry, `export * from ${JSON.stringify(join(HERE, "..", "..", "src", "snapshot.ts"))};`);
   const mod = await loadLanguage({}, entry);
+  rmSync(dir, { recursive: true, force: true });
   for (let i = 0; i < 4; i++) {
     await assert.rejects(mod.resyncSnapshot(LANG, {}, { complete: false }), /tags/);
   }
