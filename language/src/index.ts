@@ -2,6 +2,7 @@ import {
   holochainRegisterDnas,
   holochainCall,
   agentDid,
+  languageAddress,
 } from "ad4m:host";
 import {
   bytesToB64,
@@ -9,6 +10,8 @@ import {
   deepDecode,
   deepEncode,
 } from "./holo";
+import { mountShapesFor } from "./shapes";
+import { lastSnapshot, takeSnapshot } from "./snapshot";
 
 // Filled by the two template-banner lines at the top of the built bundle:
 //   //!@ad4m-template-variable
@@ -44,6 +47,42 @@ export async function teardown(): Promise<void> {}
 
 export function isPublic(): boolean {
   return false;
+}
+
+// --- Mount contract (B2 read side; see spec/09-b2-read-side.md) ---
+
+export async function mountShapes(): Promise<object> {
+  return mountShapesFor(languageAddress());
+}
+
+export async function mountSnapshot(): Promise<object> {
+  return takeSnapshot(languageAddress());
+}
+
+export async function expressionGet(address: string): Promise<object | null> {
+  // `address` is the URL path — the create action hash, or `profile/<key>`.
+  if (!lastSnapshot.has(address)) {
+    try {
+      await mountSnapshot();
+    } catch {
+      // fall through; a failed refresh still answers from the last snapshot
+    }
+  }
+  const hit = lastSnapshot.get(address);
+  if (!hit) return null;
+  const { data } = hit;
+  // WireRecord.createdAt is a Holochain Timestamp in microseconds; divide by
+  // 1000 to get Date's milliseconds (verified on the rig — see REPORT-b2.md).
+  const ts =
+    typeof data.recordCreatedAt === "number"
+      ? new Date(data.recordCreatedAt / 1000).toISOString()
+      : null;
+  return {
+    author: (data.creator as string) ?? null,
+    timestamp: ts,
+    data,
+    proof: { signature: "", key: "", valid: false, invalid: true },
+  };
 }
 
 interface InteractionParameter {
