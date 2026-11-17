@@ -162,16 +162,19 @@ export class MountState {
    * is removed at `removeAfter` strikes. See the class comment.
    */
   applySnapshot(read: SnapshotEntry[], seq: number, info: FullReadInfo = {}): MountDelta {
+    const changed = this.applyChanged(read, seq);
+    const removed = this.finishFullRead(new Set(read.map((e) => e.address)), seq, info);
+    return { changed, removed };
+  }
+
+  /** The absence/removal half of applySnapshot, for a full read applied in
+   *  phases (snapshot.ts: connections before the outcomes derived from
+   *  them). `seen` = every address the read listed. Answers the removed. */
+  finishFullRead(seen: Set<string>, seq: number, info: FullReadInfo = {}): string[] {
     const complete = info.complete !== false;
     const startedAt = info.startedAt ?? Date.now();
-    const changed: SnapshotEntry[] = [];
-    const seen = new Set<string>();
-    for (const e of read) {
-      seen.add(e.address);
-      if (this.apply(e, seq)) changed.push(e);
-    }
     const removed: string[] = [];
-    if (!complete) return { changed, removed };
+    if (!complete) return removed;
     for (const addr of [...this.entries.keys()]) {
       if (seen.has(addr)) continue;
       if ((this.seqOf.get(addr) ?? 0) > seq) continue;
@@ -186,7 +189,7 @@ export class MountState {
       this.remove(addr);
       removed.push(addr);
     }
-    return { changed, removed };
+    return removed;
   }
 
   /** Addresses our own delete zome call reported deleted — exact, so they

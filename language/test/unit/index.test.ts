@@ -14,6 +14,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
+  CONNECTION_AB,
+  connectionEntry,
   LANG,
   OUTCOME_A,
   OUTCOME_B,
@@ -296,4 +298,27 @@ test("write-path / unknown-address refreshes remove nothing immediately", async 
   assert.ok(await lang.expressionGet(OUTCOME_A), "A removed by an unknown-address refresh");
   const { entries } = await lang.mountSnapshot();
   assert.ok(entries.some((e: any) => e.address === OUTCOME_A), "A removed by the next resync");
+});
+
+// ---- derived edges from the guarded mount (Lal round 3, F2) ----------------
+
+test("a full read missing a mounted connection keeps the outcomes' edges", async () => {
+  const c = wireRecord(connectionEntry(), { actionHash: CONNECTION_AB }); // A -> B
+  const host: Host = {
+    local: { outcomes: [outcomeA(), outcomeB()], connections: [c] },
+    network: {},
+    emitted: [],
+  };
+  installHost(host);
+  const lang = await loadLanguage();
+  const first = await lang.mountSnapshot();
+  const b0 = first.entries.find((e: any) => e.address === OUTCOME_B);
+  assert.equal(b0?.data.parent, `${LANG}://${OUTCOME_A}`, "precondition: B.parent is A");
+  host.local.connections = []; // dropped from the list, not (provably) deleted
+  const { entries } = await lang.mountSnapshot();
+  const b = entries.find((e: any) => e.address === OUTCOME_B);
+  const a = entries.find((e: any) => e.address === OUTCOME_A);
+  assert.equal(b?.data.parent, `${LANG}://${OUTCOME_A}`, "B.parent erased by an incomplete list");
+  assert.deepEqual(a?.data.children, [`${LANG}://${OUTCOME_B}`]);
+  assert.ok(entries.some((e: any) => e.address === CONNECTION_AB), "connection removed on one read");
 });

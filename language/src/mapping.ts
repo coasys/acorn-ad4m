@@ -44,6 +44,43 @@ export function deriveRelations(connections: any[]): Derived {
   return { parents, children };
 }
 
+/** Derived edges from the MOUNTED connections (Lal round 3, F2): only
+ *  connections that passed the revision guard feed parent/children, and a
+ *  connection a read merely failed to list keeps its edge until the
+ *  connection itself is removed. Mount order = first-seen order. */
+export function deriveFromMounted(
+  entries: Iterable<[string, { class: string; data: Record<string, unknown> }]>,
+  lang: string
+): Derived {
+  const rows: any[] = [];
+  for (const [, e] of entries) {
+    if (e.class !== "AcornConnection") continue;
+    const { parent, child } = e.data;
+    if (parent == null || child == null) continue;
+    rows.push({ parentActionHash: urlToHash(parent, lang), childActionHash: urlToHash(child, lang) });
+  }
+  return deriveRelations(rows);
+}
+
+// Re-expand one outcome's mounted data with recomputed derived edges —
+// same semantics as toData's parent/children (the fallback when the
+// outcome itself did not fetch).
+export function reexpandOutcome(
+  addr: string,
+  data: Record<string, unknown>,
+  derived: Derived,
+  lang: string
+): { class: string; address: string; data: Record<string, unknown> } {
+  const out = { ...data };
+  const parent = derived.parents.get(addr);
+  if (parent) out.parent = `${lang}://${parent}`;
+  else delete out.parent;
+  const children = derived.children.get(addr);
+  if (children?.length) out.children = children.map((h) => `${lang}://${h}`);
+  else delete out.children;
+  return { class: "AcornOutcome", address: addr, data: out };
+}
+
 /** The mount address of a record: its create action hash, or
  *  `profile/<AgentPubKeyB64>` for profiles (fetch_agents returns bare
  *  Profiles — Correction 6). */

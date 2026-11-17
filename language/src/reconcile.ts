@@ -16,6 +16,10 @@
 //    latest due deadline, whichever is sooner. A failed, timed-out or
 //    empty read is inconclusive: no change, retried after `retryMs`
 //    (default 650 ms) until the deadline, then left to the resync.
+//  - Derived edges (Lal round 3, F2): connection targets apply first;
+//    parent/children then come from the MOUNTED connections only
+//    (mapping.ts deriveFromMounted), so a stale connection the guard
+//    rejected, or one a fetch failed to list, never moves an edge.
 //  - Ordered: every pass takes a MountState sequence number before its
 //    reads and applies through MountState's guard (state.ts) — an older
 //    revision never replaces a newer one, whatever finished last. Passes
@@ -37,7 +41,8 @@
 
 import { agentToDid } from "./agent";
 import {
-  deriveRelations,
+  deriveFromMounted,
+  reexpandOutcome,
   toData,
   urlToHash,
   type Derived,
@@ -86,25 +91,6 @@ function num(v: unknown): number | undefined {
   if (typeof v === "number") return v;
   if (typeof v === "bigint") return Number(v);
   return undefined;
-}
-
-// Re-expand one outcome's mounted data with recomputed derived edges —
-// same semantics as toData's parent/children (the fallback when the
-// outcome itself did not fetch).
-function reexpandOutcome(
-  addr: string,
-  data: Record<string, unknown>,
-  derived: Derived,
-  lang: string
-): SnapshotEntry {
-  const out = { ...data };
-  const parent = derived.parents.get(addr);
-  if (parent) out.parent = `${lang}://${parent}`;
-  else delete out.parent;
-  const children = derived.children.get(addr);
-  if (children?.length) out.children = children.map((h) => `${lang}://${h}`);
-  else delete out.children;
-  return { class: "AcornOutcome", address: addr, data: out };
 }
 
 const TIMED_OUT = Symbol("timed out");
@@ -282,9 +268,6 @@ export class Reconciler {
   private async pass(due: Dirty[], now: number): Promise<void> {
     this.stats.passes++;
     const kinds = new Set<FetchKind>(due.map((d) => d.kind));
-    if (due.some((d) => d.class === "AcornOutcome" || d.class === "AcornConnection")) {
-      kinds.add("connections");
-    }
     if (due.some((d) => d.class === "AcornConnection")) kinds.add("outcomes");
     const gens = new Map(due.map((d) => [d, d.gen]));
     const latest = Math.max(...due.map((d) => d.deadline));
@@ -296,23 +279,81 @@ export class Reconciler {
         [...kinds].map(async (k) => [k, await this.fetchBounded(k, ms)] as const)
       )
     );
-    const conns = rows.get("connections");
-    const derived = conns ? deriveRelations(conns) : null;
 
+    // Lal round 3, F2: connections first, through the guard; then every
+    // derived edge comes from the MOUNTED connections — a stale connection
+    // the guard rejected, or one a read failed to list, never moves an edge.
     const changed = new Map<string, SnapshotEntry>();
-    const after = Date.now();
-    for (const d of due) {
-      let done = false;
+    const done = new Map<Dirty, boolean>();
+    const ends = new Set<string>();
+    const run = (d: Dirty, f: () => boolean) => {
       try {
-        done = this.check(d, rows, derived, seq, changed);
+        done.set(d, f());
       } catch (e) {
         console.error("acorn reconcile:", e);
+        done.set(d, false);
       }
+    };
+    for (const d of due) {
+      if (d.class === "AcornConnection") run(d, () => this.checkConnection(d, rows, seq, changed, ends));
+    }
+    const derived = deriveFromMounted(this.o.state.entries, this.o.lang);
+    for (const d of due) {
+      if (d.class !== "AcornConnection") run(d, () => this.check(d, rows, derived, seq, changed));
+    }
+    const outs = rows.get("outcomes") ?? null;
+    for (const end of ends) this.expand(end, outs, derived, seq, changed);
+
+    const after = Date.now();
+    for (const d of due) {
       if (this.queue.get(d.key) !== d) continue;
-      if (done && d.gen === gens.get(d)) this.queue.delete(d.key);
+      if (done.get(d) && d.gen === gens.get(d)) this.queue.delete(d.key);
       else d.nextAt = d.gen !== gens.get(d) ? after : after + this.retryMs;
     }
     if (changed.size) this.o.emit({ changed: [...changed.values()], removed: [] });
+  }
+
+  // A hinted connection: applied through the guard; its old (mounted) and
+  // fetched endpoints are re-expanded after the pass derives edges.
+  private checkConnection(
+    d: Dirty,
+    rows: Map<FetchKind, any[] | null>,
+    seq: number,
+    changed: Map<string, SnapshotEntry>,
+    ends: Set<string>
+  ): boolean {
+    const list = rows.get("connections");
+    if (!list) return false; // inconclusive read
+    const addr = d.address!;
+    const rec = list.find((r: any) => r?.actionHash === addr);
+    if (!rec) return false;
+    const cur = this.o.state.entries.get(addr);
+    if (cur && cur.class !== "AcornConnection") return true; // not ours to touch
+    for (const u of [cur?.data.parent, cur?.data.child]) {
+      if (u != null) ends.add(urlToHash(u, this.o.lang));
+    }
+    for (const h of [rec.entry?.parentActionHash, rec.entry?.childActionHash]) {
+      if (typeof h === "string" && h) ends.add(h);
+    }
+    this.put(
+      { class: "AcornConnection", address: addr, data: toData("AcornConnection", rec, this.mapCtx(null)) },
+      seq,
+      changed
+    );
+    return this.resolvedAt(d, rec);
+  }
+
+  // Revision bookkeeping for a fetched record: true when the dirty record
+  // can stop polling (see the header).
+  private resolvedAt(d: Dirty, rec: any): boolean {
+    const rev = num(rec.updatedAt);
+    if (rev === undefined) return d.updates <= 0;
+    if (rev > d.lastRev) {
+      // the first sighting of a hinted create is the create, not an update
+      if (!(d.create && d.lastRev === -Infinity)) d.updates = Math.max(0, d.updates - 1);
+      d.lastRev = rev;
+    }
+    return d.updates <= 0 && rev >= d.want;
   }
 
   private mapCtx(derived: Derived | null): MapCtx {
@@ -377,48 +418,27 @@ export class Reconciler {
     if (!rec) return false;
     const cur = state.entries.get(addr);
     if (cur && cur.class !== d.class) return true; // not ours to touch
-    if ((d.class === "AcornOutcome" || d.class === "AcornConnection") && !derived) {
-      return false; // derived edges unreadable: inconclusive
-    }
-    const oldEnds =
-      d.class === "AcornConnection" && cur
-        ? [cur.data.parent, cur.data.child].map((u) =>
-            u != null ? urlToHash(u, this.o.lang) : null
-          )
-        : [];
     this.put({ class: d.class, address: addr, data: toData(d.class, rec, mctx) }, seq, changed);
-
-    if (d.class === "AcornConnection") {
-      const outs = rows.get("outcomes");
-      if (!outs) return false;
-      for (const end of [...oldEnds, rec.entry?.parentActionHash, rec.entry?.childActionHash]) {
-        this.expand(end, outs, derived!, seq, changed);
-      }
-    }
-
-    const rev = num(rec.updatedAt);
-    if (rev === undefined) return d.updates <= 0;
-    if (rev > d.lastRev) {
-      // the first sighting of a hinted create is the create, not an update
-      if (!(d.create && d.lastRev === -Infinity)) d.updates = Math.max(0, d.updates - 1);
-      d.lastRev = rev;
-    }
-    return d.updates <= 0 && rev >= d.want;
+    return this.resolvedAt(d, rec);
   }
 
-  // Re-expand one outcome's parent/children against this pass's
-  // connections: the fetched outcome when listed, else its mounted data.
+  // Re-expand one outcome's parent/children against the mount-derived
+  // edges: its MOUNTED data when mounted (a fetched copy could be an
+  // older revision), else the fetched record when the pass read one.
   private expand(
-    addr: unknown,
-    outs: any[],
+    addr: string,
+    outs: any[] | null,
     derived: Derived,
     seq: number,
     changed: Map<string, SnapshotEntry>
   ) {
-    if (typeof addr !== "string" || addr === "") return;
     const cur = this.o.state.entries.get(addr);
-    if (cur && cur.class !== "AcornOutcome") return;
-    const rec = outs.find((r: any) => r?.actionHash === addr);
+    if (cur) {
+      if (cur.class !== "AcornOutcome") return;
+      this.put(reexpandOutcome(addr, cur.data, derived, this.o.lang), seq, changed);
+      return;
+    }
+    const rec = outs?.find((r: any) => r?.actionHash === addr);
     if (rec) {
       this.put(
         {
@@ -429,8 +449,6 @@ export class Reconciler {
         seq,
         changed
       );
-    } else if (cur) {
-      this.put(reexpandOutcome(addr, cur.data, derived, this.o.lang), seq, changed);
     }
   }
 }

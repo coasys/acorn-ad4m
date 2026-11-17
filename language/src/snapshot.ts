@@ -6,7 +6,13 @@
 
 import { holochainCall } from "ad4m:host";
 import { agentToDid } from "./agent";
-import { addressOf, deriveRelations, toData, type MapCtx } from "./mapping";
+import {
+  addressOf,
+  deriveFromMounted,
+  reexpandOutcome,
+  toData,
+  type MapCtx,
+} from "./mapping";
 import {
   mountState,
   type MountDelta,
@@ -27,10 +33,15 @@ function isNoProjectMeta(e: unknown): boolean {
 
 // A full read reconciled into the mount state (state.ts MountState): the
 // sequence number is taken before the reads start, so a signal-driven
-// fetch that lands meanwhile is ordered correctly against it. Answers the
-// whole mount after the merge plus the delta the merge made.
+// fetch that lands meanwhile is ordered correctly against it. Applied in
+// two phases (Lal round 3, F2): every class but outcomes first, then the
+// outcomes with parent/children derived from the MOUNTED connections —
+// only guard-accepted connections feed edges, and a connection this read
+// failed to list keeps its edge until it is itself removed (F1). If the
+// removal pass drops a connection, the mounted outcomes are re-derived.
 // `complete: false` marks a read whose absences must not count toward
-// removal (the worker's overflow fallback — Lal round 3, F1).
+// removal (the worker's overflow fallback — Lal round 3, F1). Answers the
+// whole mount after the merge plus the delta the merge made.
 export async function resyncSnapshot(
   lang: string,
   own: SnapshotIdentity = {},
@@ -38,12 +49,39 @@ export async function resyncSnapshot(
 ): Promise<{ entries: SnapshotEntry[]; delta: MountDelta; seq: number }> {
   const seq = mountState.beginRead();
   const startedAt = Date.now();
-  const read = await readSnapshot(lang, own);
-  const delta = mountState.applySnapshot(read, seq, {
+  const { others, outcomes, ctx } = await readSnapshot(lang, own);
+  const changed = new Map<string, SnapshotEntry>();
+  const note = (es: SnapshotEntry[]) => es.forEach((e) => changed.set(e.address, e));
+
+  note(mountState.applyChanged(others, seq));
+  const derived = deriveFromMounted(mountState.entries, lang);
+  const outs = outcomes.map((r) => ({
+    class: "AcornOutcome",
+    address: addressOf("AcornOutcome", r),
+    data: toData("AcornOutcome", r, { ...ctx, derived }),
+  }));
+  note(mountState.applyChanged(outs, seq));
+
+  const seen = new Set([...others, ...outs].map((e) => e.address));
+  const conns = new Set(
+    [...mountState.entries].filter(([, e]) => e.class === "AcornConnection").map(([a]) => a)
+  );
+  const removed = mountState.finishFullRead(seen, seq, {
     complete: opts.complete !== false,
     startedAt,
   });
-  return { entries: mountState.list(), delta, seq };
+  if (removed.some((a) => conns.has(a))) {
+    // edges of removed connections: re-derive every mounted outcome
+    const d2 = deriveFromMounted(mountState.entries, lang);
+    const again: SnapshotEntry[] = [];
+    for (const [address, e] of mountState.entries) {
+      if (e.class !== "AcornOutcome") continue;
+      again.push(reexpandOutcome(address, e.data, d2, lang));
+    }
+    note(mountState.applyChanged(again, seq));
+  }
+  for (const a of removed) changed.delete(a);
+  return { entries: mountState.list(), delta: { changed: [...changed.values()], removed }, seq };
 }
 
 export async function takeSnapshot(
@@ -54,11 +92,12 @@ export async function takeSnapshot(
   return { entries };
 }
 
-// Every Acorn record of the project as mount entries — reads only.
+// Every Acorn record of the project — reads only. Outcomes come back raw:
+// their derived edges are computed against the mount (resyncSnapshot).
 async function readSnapshot(
   lang: string,
   own: SnapshotIdentity
-): Promise<SnapshotEntry[]> {
+): Promise<{ others: SnapshotEntry[]; outcomes: any[]; ctx: MapCtx }> {
   const [
     outcomes,
     connections,
@@ -95,17 +134,15 @@ async function readSnapshot(
     agentToDid,
     ownAgent: own.ownAgent,
     ad4mDid: own.ad4mDid,
-    derived: deriveRelations(connections),
   };
 
-  const entries: SnapshotEntry[] = [];
+  const others: SnapshotEntry[] = [];
   const push = (className: string, record: any) => {
     const data = toData(className, record, ctx);
     const address = addressOf(className, record);
-    entries.push({ class: className, address, data });
+    others.push({ class: className, address, data });
   };
 
-  for (const r of outcomes ?? []) push("AcornOutcome", r);
   for (const r of connections ?? []) push("AcornConnection", r);
   for (const r of entryPoints ?? []) push("AcornEntryPoint", r);
   for (const r of comments ?? []) push("AcornOutcomeComment", r);
@@ -115,5 +152,5 @@ async function readSnapshot(
   for (const r of members ?? []) push("AcornMember", r);
   for (const p of profiles ?? []) push("AcornProfile", p);
 
-  return entries;
+  return { others, outcomes: outcomes ?? [], ctx };
 }
