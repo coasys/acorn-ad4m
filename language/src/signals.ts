@@ -48,13 +48,9 @@ import {
   type Derived,
   type MapCtx,
 } from "./mapping";
-import type { SnapshotEntry } from "./state";
+import type { MountDelta, SnapshotEntry } from "./state";
 
-export interface MountDelta {
-  address?: string;
-  changed: SnapshotEntry[];
-  removed: string[];
-}
+export type { MountDelta };
 
 // The collections a signal's verification can need — the same fetch_* zome
 // reads takeSnapshot uses (zomes.md). `input` is the ZomeFnInput's inner
@@ -280,10 +276,12 @@ export async function signalToDelta(
 
   // The fetched record behind a claimed actionHash, or null when the claim
   // never verifies. A create confirms on presence; an update confirms once
-  // the fetched record's `updatedAt` differs from the mount's last-seen
-  // `recordUpdatedAt` — provable new state. The claim's own `updatedAt`
-  // cannot be the check: hdk_crud stamps signals with sys_time(), which
-  // only approximates the action's stored timestamp, so it never matches.
+  // the fetched record's `updatedAt` is GREATER than the mount's
+  // `recordUpdatedAt` (Lal round 2 #2: "different" let a lagging
+  // authority's older revision in). The claim's own `updatedAt` cannot be
+  // the check: hdk_crud stamps signals with sys_time(), which only
+  // approximates the action's stored timestamp. The caller applies the
+  // result through MountState, which re-checks the order at apply time.
   const confirmRecord = async (
     kind: FetchKind,
     hash: string,
@@ -294,8 +292,12 @@ export async function signalToDelta(
       const rec =
         (await freshRows(kind)).find((r: any) => r?.actionHash === hash) ?? null;
       if (!rec) return null;
-      if (forUpdate && prevStamp !== undefined && rec.updatedAt === prevStamp) {
-        return null; // still the pre-signal state — keep waiting
+      if (
+        forUpdate &&
+        typeof prevStamp === "number" &&
+        !(typeof rec.updatedAt === "number" && rec.updatedAt > prevStamp)
+      ) {
+        return null; // not newer than what is mounted — keep waiting
       }
       return rec;
     });

@@ -1,13 +1,15 @@
 // mountSnapshot(): every Acorn record of the project as mount entries
 // (design §4.3). Nine reads in one Promise.all — the language's call queue
-// is shared with writes, so the snapshot must stay fast (R6). The last
-// snapshot is kept in a module-level map for expressionGet.
+// is shared with writes, so the snapshot must stay fast (R6). The result
+// is merged into the module-level mount state (state.ts) through its
+// revision guard; the merged mount is what mountSnapshot answers.
 
 import { holochainCall } from "ad4m:host";
 import { agentToDid } from "./agent";
 import { addressOf, deriveRelations, toData, type MapCtx } from "./mapping";
 import {
-  lastSnapshot,
+  mountState,
+  type MountDelta,
   type SnapshotEntry,
   type SnapshotIdentity,
 } from "./state";
@@ -23,10 +25,33 @@ function isNoProjectMeta(e: unknown): boolean {
     .includes("no project meta");
 }
 
+// A full read reconciled into the mount state (state.ts MountState): the
+// sequence number is taken before the reads start, so a signal-driven
+// fetch that lands meanwhile is ordered correctly against it. Answers the
+// whole mount after the merge plus the delta the merge made.
+export async function resyncSnapshot(
+  lang: string,
+  own: SnapshotIdentity = {}
+): Promise<{ entries: SnapshotEntry[]; delta: MountDelta }> {
+  const seq = mountState.beginRead();
+  const read = await readSnapshot(lang, own);
+  const delta = mountState.applySnapshot(read, seq);
+  return { entries: mountState.list(), delta };
+}
+
 export async function takeSnapshot(
   lang: string,
   own: SnapshotIdentity = {}
 ): Promise<{ entries: SnapshotEntry[] }> {
+  const { entries } = await resyncSnapshot(lang, own);
+  return { entries };
+}
+
+// Every Acorn record of the project as mount entries — reads only.
+async function readSnapshot(
+  lang: string,
+  own: SnapshotIdentity
+): Promise<SnapshotEntry[]> {
   const [
     outcomes,
     connections,
@@ -67,12 +92,10 @@ export async function takeSnapshot(
   };
 
   const entries: SnapshotEntry[] = [];
-  lastSnapshot.clear();
   const push = (className: string, record: any) => {
     const data = toData(className, record, ctx);
     const address = addressOf(className, record);
     entries.push({ class: className, address, data });
-    lastSnapshot.set(address, { class: className, data });
   };
 
   for (const r of outcomes ?? []) push("AcornOutcome", r);
@@ -85,5 +108,5 @@ export async function takeSnapshot(
   for (const r of members ?? []) push("AcornMember", r);
   for (const p of profiles ?? []) push("AcornProfile", p);
 
-  return { entries };
+  return entries;
 }

@@ -175,6 +175,23 @@ test("update signal while the fetch still shows the pre-update state -> null", a
   assert.equal(d, null);
 });
 
+test("update hint whose fetch answers an OLDER stamp than mounted -> null (P2)", async () => {
+  // Lal round 2 #2, seen on the rig (b3 connection move): the mount holds
+  // the newer revision (from the write's own snapshot); a lagging network
+  // authority still answers the previous one. "Different stamp" let it in.
+  const mounted = { ...outcomeA(), updatedAt: outcomeA().updatedAt + 1000 };
+  const snapshot = mkSnapshot([{ class: "AcornOutcome", rec: mounted }]);
+  const older = { ...outcomeA(), entry: { ...(outcomeA().entry as object), content: "stale" } };
+  const d = await signalToDelta(
+    {
+      signalType: "Outcome",
+      data: { entryType: "outcome", action: "update", data: mounted },
+    },
+    ctx(snapshot, fetchOf({ outcomes: [older] }))
+  );
+  assert.equal(d, null);
+});
+
 test("update signal -> fetched record once its stamp moved on", async () => {
   const snapshot = mkSnapshot([{ class: "AcornOutcome", rec: outcomeA() }]);
   const newer = { ...outcomeA(), updatedAt: outcomeA().updatedAt + 1 };

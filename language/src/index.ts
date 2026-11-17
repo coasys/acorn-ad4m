@@ -14,7 +14,7 @@ import {
 import { agentToDid } from "./agent";
 import { toData } from "./mapping";
 import { isClassName, mountShapesFor } from "./shapes";
-import { lastSnapshot } from "./state";
+import { lastSnapshot, mountState } from "./state";
 import { takeSnapshot } from "./snapshot";
 import {
   decodeSignalEnvelope,
@@ -123,6 +123,9 @@ export async function handleHolochainSignal(signal: any): Promise<void> {
     if (!hasMounted) return;
     const decoded = decodeSignalEnvelope(signal?.payload);
     if (!decoded) return;
+    // taken before any fetch: every read this hint makes is ordered after
+    // it, and the guard below compares against what is mounted on APPLY
+    const seq = mountState.beginRead();
     const delta = await signalToDelta(decoded, {
       lang: languageAddress(),
       snapshot: lastSnapshot,
@@ -135,13 +138,9 @@ export async function handleHolochainSignal(signal: any): Promise<void> {
       fetch: fetchRows,
     });
     if (!delta) return;
-    for (const e of delta.changed) {
-      lastSnapshot.set(e.address, { class: e.class, data: e.data });
-    }
-    for (const a of delta.removed) {
-      lastSnapshot.delete(a);
-    }
-    emitSignal({ mountDelta: delta });
+    const changed = mountState.applyChanged(delta.changed, seq);
+    if (changed.length === 0) return;
+    emitSignal({ mountDelta: { changed, removed: [] } });
   } catch (e) {
     console.error("handleHolochainSignal:", e);
   }
