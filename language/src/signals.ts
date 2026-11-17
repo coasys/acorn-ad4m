@@ -24,9 +24,10 @@
 //
 // `signalToDelta` is async and poll-bounded: a signal routinely lands
 // before the op it announces has gossiped in, so each confirmation polls
-// `ctx.confirmTries` × `ctx.confirmDelayMs` (default 8 × 700 ms) before
-// giving up to the 15 s resync. Fetch errors propagate — an unreadable
-// collection must never look like "confirmed gone".
+// `ctx.confirmTries` × `ctx.confirmDelayMs` (default 20 × 650 ms ≈ 13 s —
+// under the ~15 s resync it is meant to beat and the 60 s language call
+// budget) before deferring to the resync. Fetch errors propagate — an
+// unreadable collection must never look like "confirmed gone".
 
 import { decode } from "@msgpack/msgpack";
 import { agentToDid } from "./agent";
@@ -118,7 +119,7 @@ export interface SignalCtx {
   ownAgent?: string;
   ad4mDid?: string;
   /** poll budget for confirming a claim before deferring to the resync
-   *  (default 8 × 700 ms ≈ 5.6 s — inside the 60 s language call budget) */
+   *  (default 20 × 650 ms ≈ 13 s — under the ~15 s resync) */
   confirmTries?: number;
   confirmDelayMs?: number;
 }
@@ -241,8 +242,8 @@ export async function signalToDelta(
   const action: unknown = payload.action;
   const inner = payload.data;
 
-  const tries = Math.max(1, ctx.confirmTries ?? 8);
-  const delayMs = Math.max(0, ctx.confirmDelayMs ?? 700);
+  const tries = Math.max(1, ctx.confirmTries ?? 20);
+  const delayMs = Math.max(0, ctx.confirmDelayMs ?? 650);
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
   // Fetch cache: `rows` gives the freshest list already pulled (each
@@ -268,28 +269,26 @@ export async function signalToDelta(
   };
 
   // The fetched record behind a claimed actionHash, or null when the claim
-  // never verifies. For an "update" claim carrying `updatedAt` (the
-  // WireRecord the zome call returned) the poll waits for at least that
-  // version; on budget exhaustion the last real record seen still answers —
-  // stale but verified, a re-assert or a no-op, never the claim.
+  // never verifies. A create confirms on presence; an update confirms once
+  // the fetched record's `updatedAt` differs from the mount's last-seen
+  // `recordUpdatedAt` — provable new state. The claim's own `updatedAt`
+  // cannot be the check: hdk_crud stamps signals with sys_time(), which
+  // only approximates the action's stored timestamp, so it never matches.
   const confirmRecord = async (
     kind: FetchKind,
     hash: string,
-    claimedUpdatedAt?: unknown
+    forUpdate?: boolean
   ): Promise<any | null> => {
-    const want = typeof claimedUpdatedAt === "number" ? claimedUpdatedAt : null;
-    let lastSeen: any = null;
-    const hit = await poll(async () => {
+    const prevStamp = ctx.snapshot.get(hash)?.data?.recordUpdatedAt;
+    return poll(async () => {
       const rec =
         (await freshRows(kind)).find((r: any) => r?.actionHash === hash) ?? null;
       if (!rec) return null;
-      lastSeen = rec;
-      if (want != null && !(typeof rec.updatedAt === "number" && rec.updatedAt >= want)) {
-        return null;
+      if (forUpdate && prevStamp !== undefined && rec.updatedAt === prevStamp) {
+        return null; // still the pre-signal state — keep waiting
       }
       return rec;
     });
-    return hit ?? lastSeen;
   };
 
   // True only when the record is confirmed ABSENT after the full poll
@@ -347,7 +346,7 @@ export async function signalToDelta(
     const connClaim = inner?.maybeConnection;
     const connHash = str(connClaim?.actionHash);
     const outcomeRec = addr
-      ? await confirmRecord("outcomes", addr, claim?.updatedAt)
+      ? await confirmRecord("outcomes", addr)
       : null;
     const connRec = connHash
       ? await poll(
@@ -514,11 +513,7 @@ export async function signalToDelta(
   if (action === "create" || action === "update") {
     const addr = str(inner?.actionHash);
     if (!addr) return null;
-    const rec = await confirmRecord(
-      kind,
-      addr,
-      action === "update" ? inner?.updatedAt : undefined
-    );
+    const rec = await confirmRecord(kind, addr, action === "update");
     if (!rec) return null;
     const derived =
       className === "AcornOutcome" || className === "AcornConnection"

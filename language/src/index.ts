@@ -77,8 +77,50 @@ export function isPublic(): boolean {
 // so a forged or stale signal payload never reaches the mount. The
 // signal's own writes echo back through this path too (get_peers
 // includes the sender) and are a no-op: applying a delta is a diff.
+//
+// Signals are only verified once the first snapshot has run — before any
+// mount there is nothing to invalidate, and the mount itself picks the
+// records up (a stock-side burst of hundreds of signals would otherwise
+// starve the runtime in fetch-verification).
+let hasMounted = false;
+
+// Verified-collection fetch for signal handlers: network get, with
+// in-flight dedup and a small freshness window — a burst of signals (or a
+// poll loop's retries) coalesces onto one zome read instead of one each.
+const fetchRowsCache = new Map<string, { t: number; rows: any[] }>();
+const fetchRowsInflight = new Map<string, Promise<any[]>>();
+const FETCH_ROWS_TTL_MS = 400;
+
+function fetchRows(kind: string): Promise<any[]> {
+  const hit = fetchRowsCache.get(kind);
+  if (hit && Date.now() - hit.t < FETCH_ROWS_TTL_MS) {
+    return Promise.resolve(hit.rows);
+  }
+  const pending = fetchRowsInflight.get(kind);
+  if (pending) return pending;
+  const spec = FETCH_SPEC[kind as keyof typeof FETCH_SPEC];
+  const p = holochainCall(NICK, spec.zome, spec.fn, {
+    input: spec.input,
+    local: false,
+  }).then(
+    (res) => {
+      fetchRowsInflight.delete(kind);
+      const rows = Array.isArray(res) ? res : res == null ? [] : [res];
+      fetchRowsCache.set(kind, { t: Date.now(), rows });
+      return rows;
+    },
+    (err) => {
+      fetchRowsInflight.delete(kind);
+      throw err;
+    }
+  );
+  fetchRowsInflight.set(kind, p);
+  return p;
+}
+
 export async function handleHolochainSignal(signal: any): Promise<void> {
   try {
+    if (!hasMounted) return;
     const decoded = decodeSignalEnvelope(signal?.payload);
     if (!decoded) return;
     const delta = await signalToDelta(decoded, {
@@ -86,14 +128,11 @@ export async function handleHolochainSignal(signal: any): Promise<void> {
       snapshot: lastSnapshot,
       ownAgent: ownAgentKey(),
       ad4mDid: agentDid(),
-      fetch: async (kind) => {
-        const spec = FETCH_SPEC[kind];
-        const res = await holochainCall(NICK, spec.zome, spec.fn, {
-          input: spec.input,
-          local: true,
-        });
-        return Array.isArray(res) ? res : res == null ? [] : [res];
-      },
+      // Network get: a signal routinely lands BEFORE gossip delivers the
+      // op; GetStrategy::Network queries the DHT now, which is what keeps
+      // the verify ahead of the 15 s resync (the snapshot reads stay
+      // local — they are bulk polls, not confirmations).
+      fetch: fetchRows,
     });
     if (!delta) return;
     for (const e of delta.changed) {
@@ -121,7 +160,9 @@ function snapshotIdentity() {
 }
 
 export async function mountSnapshot(): Promise<object> {
-  return takeSnapshot(languageAddress(), snapshotIdentity());
+  const snap = await takeSnapshot(languageAddress(), snapshotIdentity());
+  hasMounted = true;
+  return snap;
 }
 
 export async function expressionGet(address: string): Promise<object | null> {

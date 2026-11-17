@@ -153,6 +153,39 @@ test("forged update signal emits the fetched record, not the claimed one", async
   assert.equal(d.changed[0].data.content, "Write the spec");
 });
 
+test("update signal while the fetch still shows the pre-update state -> null", async () => {
+  // The claim's updatedAt is only sys_time()'s approximation — never the
+  // check. The proof of an update is the fetched record's stamp differing
+  // from what the mount holds; while they are equal the update has not
+  // arrived and nothing is emitted.
+  const snapshot = mkSnapshot([{ class: "AcornOutcome", rec: outcomeA() }]);
+  const d = await signalToDelta(
+    {
+      signalType: "Outcome",
+      data: {
+        entryType: "outcome",
+        action: "update",
+        data: { ...outcomeA(), updatedAt: 9999999999999999 },
+      },
+    },
+    ctx(snapshot, fetchOf({ outcomes: [outcomeA()] }))
+  );
+  assert.equal(d, null);
+});
+
+test("update signal -> fetched record once its stamp moved on", async () => {
+  const snapshot = mkSnapshot([{ class: "AcornOutcome", rec: outcomeA() }]);
+  const newer = { ...outcomeA(), updatedAt: outcomeA().updatedAt + 1 };
+  const d = await signalToDelta(
+    {
+      signalType: "Outcome",
+      data: { entryType: "outcome", action: "update", data: newer },
+    },
+    ctx(snapshot, fetchOf({ outcomes: [newer] }))
+  );
+  assert.equal(d?.changed[0]?.address, OUTCOME_A);
+});
+
 test("forged update of a record that does not exist -> null", async () => {
   const d = await signalToDelta(
     {
