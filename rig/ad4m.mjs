@@ -206,8 +206,45 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       console.log(JSON.stringify(await rpc("agent.status"), null, 2));
     } else if (cmd === "langs") {
       for (const l of await rpc("language.all")) console.log(l.address, l.name);
+    } else if (cmd === "ensureagent") {
+      // agent.generate on first run, agent.unlock after; prints the final
+      // status. run.sh's agent step.
+      const pass = process.argv[3] || "rig-passphrase";
+      let st = await rpc("agent.status");
+      if (!st.isInitialized) {
+        console.error("ensureagent: first run — agent.generate");
+        st = await agentGenerate(pass);
+      } else if (!st.isUnlocked) {
+        console.error("ensureagent: agent.unlock");
+        st = await rpc("agent.unlock", { passphrase: pass }, 180000);
+      }
+      if (st.error) throw new Error(`agent error: ${st.error}`);
+      if (!st.isUnlocked) throw new Error("agent is still locked");
+      console.log(JSON.stringify(st));
+    } else if (cmd === "publish") {
+      // copy a base bundle into the executor's languages dir, print its
+      // address. Needs AD4M_DATA (env or rig/.run/env).
+      console.log(publishLocal(process.argv[3]));
+    } else if (cmd === "warmup") {
+      // retry applyTemplateLocal until the conductor answers — the executor
+      // comes up lazily after generate/unlock (same retry as b1.test.mjs).
+      const base = process.argv[3];
+      const seed = process.argv[4] || "run-sh-warmup";
+      const t0 = Date.now();
+      for (;;) {
+        try {
+          console.log(JSON.stringify(await applyTemplateLocal(base, { seed })));
+          break;
+        } catch (e) {
+          if (Date.now() - t0 > 180000) throw e;
+          console.error(`warmup: ${e.message} — retrying in 5s`);
+          await new Promise((r) => setTimeout(r, 5000));
+        }
+      }
     } else {
-      console.log("usage: ad4m.mjs generate [pass]|status|langs");
+      console.log(
+        "usage: ad4m.mjs generate [pass]|ensureagent <pass>|publish <bundle>|warmup <base> [seed]|status|langs"
+      );
       process.exitCode = 1;
     }
   } catch (e) {
