@@ -78,5 +78,6 @@ test("taskList/timeFrame accept the mounted JSON-string form", () => {
     { taskList: JSON.stringify([{ complete: true, task: "x" }]) },
     ctx
   );
-  assert.deepEqual(e.scope.Small.taskList, [{ complete: true, task: "x" }]);
+  const scope = e.scope as { Small: { taskList: unknown } };
+  assert.deepEqual(scope.Small.taskList, [{ complete: true, task: "x" }]);
 });
