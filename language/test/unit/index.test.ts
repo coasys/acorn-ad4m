@@ -181,7 +181,9 @@ test("test build — mountResync off: later mountSnapshots answer the mount with
   // on again: the next mountSnapshot reads and converges
   assert.deepEqual(await sw.execute({ enabled: true }), { enabled: true });
   const again = await lang.mountSnapshot();
-  assert.deepEqual(again.entries.map((e: any) => e.address), [OUTCOME_B]);
+  // B arrives; A is only on its first absence strike (F1: removal needs
+  // two complete absent reads 15 s apart)
+  assert.deepEqual(again.entries.map((e: any) => e.address).sort(), [OUTCOME_A, OUTCOME_B].sort());
 });
 
 test("test build — ACORN_MOUNT_RESYNC=off at build time starts with the resync off", async () => {
@@ -253,4 +255,45 @@ test("production artifact: `ACORN_MOUNT_RESYNC=off node build.mjs` keeps the res
     delete (clean as any).ACORN_TEST_BUILD;
     execFileSync("node", ["build.mjs"], { cwd: root, env: clean, stdio: "pipe" });
   }
+});
+
+// ---- removal only after repeated complete absence (Lal round 3, F1) --------
+
+const fakeAddr = (i: number) => `uhCkkFAKE${String(i).padStart(6, "0")}`;
+
+test("an overflow burst of peer hints removes nothing", async () => {
+  const host: Host = {
+    local: { outcomes: [outcomeA()] },
+    network: { outcomes: [], connections: [] },
+    emitted: [],
+  };
+  installHost(host);
+  const lang = await loadLanguage();
+  await lang.mountSnapshot();
+  host.local.outcomes = []; // the local view lost A (gossip / dropped error)
+  for (let burst = 0; burst < 3; burst++) {
+    for (let i = 0; i < 300; i++) {
+      await lang.handleHolochainSignal(
+        createHint(wireRecord(smallOutcomeEntry(), { actionHash: fakeAddr(burst * 1000 + i) }))
+      );
+    }
+    await sleep(50);
+  }
+  await sleep(200);
+  const removed = host.emitted.flatMap((s) => s.mountDelta?.removed ?? []);
+  assert.deepEqual(removed, [], "an overflow resync removed records");
+  assert.ok(await lang.expressionGet(OUTCOME_A), "A gone after the overflow bursts");
+});
+
+test("write-path / unknown-address refreshes remove nothing immediately", async () => {
+  const host: Host = { local: { outcomes: [outcomeA()] }, network: {}, emitted: [] };
+  installHost(host);
+  const lang = await loadLanguage();
+  await lang.mountSnapshot();
+  host.local.outcomes = [];
+  assert.deepEqual(await lang.interactions("uhCkkUNKNOWNaddress"), []);
+  assert.deepEqual(await lang.interactions("uhCkkUNKNOWNaddress2"), []);
+  assert.ok(await lang.expressionGet(OUTCOME_A), "A removed by an unknown-address refresh");
+  const { entries } = await lang.mountSnapshot();
+  assert.ok(entries.some((e: any) => e.address === OUTCOME_A), "A removed by the next resync");
 });

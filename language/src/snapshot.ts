@@ -29,13 +29,20 @@ function isNoProjectMeta(e: unknown): boolean {
 // sequence number is taken before the reads start, so a signal-driven
 // fetch that lands meanwhile is ordered correctly against it. Answers the
 // whole mount after the merge plus the delta the merge made.
+// `complete: false` marks a read whose absences must not count toward
+// removal (the worker's overflow fallback — Lal round 3, F1).
 export async function resyncSnapshot(
   lang: string,
-  own: SnapshotIdentity = {}
+  own: SnapshotIdentity = {},
+  opts: { complete?: boolean } = {}
 ): Promise<{ entries: SnapshotEntry[]; delta: MountDelta; seq: number }> {
   const seq = mountState.beginRead();
+  const startedAt = Date.now();
   const read = await readSnapshot(lang, own);
-  const delta = mountState.applySnapshot(read, seq);
+  const delta = mountState.applySnapshot(read, seq, {
+    complete: opts.complete !== false,
+    startedAt,
+  });
   return { entries: mountState.list(), delta, seq };
 }
 

@@ -105,8 +105,11 @@ function reconciler(): Reconciler {
     state: mountState,
     fetch: fetchRows,
     emit: (delta) => emitSignal({ mountDelta: delta }),
+    // overflow fallback: triggerable by peers (enough distinct hints), so
+    // its absences never count toward removal (Lal round 3, F1)
     resync: async () =>
-      (await resyncSnapshot(languageAddress(), snapshotIdentity())).delta,
+      (await resyncSnapshot(languageAddress(), snapshotIdentity(), { complete: false }))
+        .delta,
     identity: snapshotIdentity,
   });
   return worker;

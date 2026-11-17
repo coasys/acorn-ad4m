@@ -16,8 +16,8 @@
 //   2. RECOVERY, resync ON. A signal hint never removes (B7 P1: no stock
 //      read proves a deletion), so stock delete_outcome_fully reaches the
 //      mount only through the periodic resync: modelQuery loses outcome,
-//      connection and comment within one resync interval + one read, no
-//      syncMount. The child outcome survives. Prints the recovery latency.
+//      connection and comment once two complete resync reads >= 15 s
+//      apart have missed them (B8, F1) — bound 45 s, no syncMount. The child outcome survives. Prints the recovery latency.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
@@ -268,8 +268,10 @@ test("resync ON: stock delete_outcome_fully is recovered by the periodic resync"
   });
   t.diagnostic(`delete_outcome_fully -> ${JSON.stringify(res).slice(0, 400)}`);
 
-  // one 15 s resync interval + one snapshot read + slack
-  const RECOVERY_MS = 30000;
+  // B8 (Lal round 3, F1): removal needs two complete absent resync reads
+  // started >= 15 s apart — up to one interval until the first, one more
+  // until the second, plus the reads + slack
+  const RECOVERY_MS = 45000;
   const t0 = Date.now();
   let last = null;
   while (Date.now() - t0 < RECOVERY_MS) {

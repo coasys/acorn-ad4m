@@ -14,7 +14,7 @@ import {
   type MapCtx,
   type ToEntryCtx,
 } from "./mapping";
-import { lastSnapshot, type SnapshotEntry } from "./state";
+import { lastSnapshot, mountState, type SnapshotEntry } from "./state";
 import { isClassName, writablePropNames } from "./shapes";
 
 /** What an interaction needs besides the caller's params. */
@@ -738,6 +738,9 @@ export async function deleteRecord(
   } catch (e) {
     throw new Error(`delete: ${msg(e)}`);
   }
+  // our own committed delete is proof: these go at once (Lal round 3, F1 —
+  // a full read alone needs repeated absence before it removes)
+  mountState.removeConfirmed(removed);
 
   const snap = await ctx.snapshot();
   return {

@@ -64,20 +64,55 @@ function sameData(a: unknown, b: unknown): boolean {
  *    before it cannot bring the record back (one that began after can —
  *    it is fresh evidence of a live record).
  *
+ * Removal (Lal round 3, F1). The stock zomes give no deletion proof: a
+ * record missing from a full read may be deleted, not yet gossiped to the
+ * local DHT, or a per-record error fetch_links silently dropped. So a full
+ * read removes a mounted record only once it has been absent from
+ * `removeAfter` (2) consecutive COMPLETE full reads whose start times are
+ * at least `minAbsentIntervalMs` (15 s, the executor's resync interval)
+ * apart. A read flagged incomplete (overflow fallback, timed out) never
+ * advances that count; any sighting of the record (full read or hint
+ * fetch) resets it. This is a heuristic — removal is eventual and can
+ * still be wrong for a record unreadable for that long. The one exact
+ * removal is `removeConfirmed`: addresses our OWN delete zome call
+ * reported deleted.
+ *
  * Callers are synchronous between check and set, so the JS event loop
  * serializes applies per record.
  */
+export interface MountStateOptions {
+  /** consecutive complete absent full reads before removal (default 2) */
+  removeAfter?: number;
+  /** minimum start-to-start spacing of reads that count (default 15 000) */
+  minAbsentIntervalMs?: number;
+}
+
+export interface FullReadInfo {
+  /** false: the read is known to be partial — it never advances removal */
+  complete?: boolean;
+  /** Date.now() when the read started (default: now) */
+  startedAt?: number;
+}
+
 export class MountState {
   private counter = 0;
   private readonly seqOf = new Map<string, number>();
   private readonly tombs = new Map<string, number>();
+  /** address -> consecutive counted absences + start time of the last */
+  private readonly absent = new Map<string, { count: number; at: number }>();
+  private readonly removeAfter: number;
+  private readonly minAbsentIntervalMs: number;
 
   constructor(
     readonly entries: Map<
       string,
       { class: string; data: Record<string, unknown> }
-    > = new Map()
-  ) {}
+    > = new Map(),
+    opts: MountStateOptions = {}
+  ) {
+    this.removeAfter = Math.max(1, opts.removeAfter ?? 2);
+    this.minAbsentIntervalMs = Math.max(0, opts.minAbsentIntervalMs ?? 15000);
+  }
 
   /** A fresh sequence number; take it before the read starts. */
   beginRead(): number {
@@ -87,6 +122,7 @@ export class MountState {
   /** Apply one fetched record read at `seq`; true when the mount changed. */
   apply(e: SnapshotEntry, seq: number): boolean {
     const cur = this.entries.get(e.address);
+    if (cur && cur.class === e.class) this.absent.delete(e.address); // seen
     if (cur) {
       if (cur.class !== e.class) return false;
       const curSeq = this.seqOf.get(e.address) ?? 0;
@@ -117,13 +153,17 @@ export class MountState {
   }
 
   /**
-   * A FULL read of every collection, begun at `seq` — the periodic resync
-   * and the write paths' snapshots. Fetched records apply through the
-   * guard; a mounted record absent from the read is removed unless it was
-   * applied by a read that began after this one. This is the only path
-   * that removes (see signals.ts on why a hint cannot).
+   * A FULL read of every collection, begun at `seq` — the periodic resync,
+   * the write paths' snapshots, the unknown-address refresh and the
+   * overflow fallback. Fetched records apply through the guard. A mounted
+   * record absent from the read (and not applied by a read that began
+   * after this one) gets one absence strike if the read is complete and
+   * started at least `minAbsentIntervalMs` after its previous strike; it
+   * is removed at `removeAfter` strikes. See the class comment.
    */
-  applySnapshot(read: SnapshotEntry[], seq: number): MountDelta {
+  applySnapshot(read: SnapshotEntry[], seq: number, info: FullReadInfo = {}): MountDelta {
+    const complete = info.complete !== false;
+    const startedAt = info.startedAt ?? Date.now();
     const changed: SnapshotEntry[] = [];
     const seen = new Set<string>();
     for (const e of read) {
@@ -131,20 +171,46 @@ export class MountState {
       if (this.apply(e, seq)) changed.push(e);
     }
     const removed: string[] = [];
+    if (!complete) return { changed, removed };
     for (const addr of [...this.entries.keys()]) {
       if (seen.has(addr)) continue;
       if ((this.seqOf.get(addr) ?? 0) > seq) continue;
-      this.entries.delete(addr);
-      this.seqOf.delete(addr);
-      this.tombs.set(addr, ++this.counter);
-      if (this.tombs.size > MAX_TOMBSTONES) {
-        // oldest first (insertion order); a read older than the evicted
-        // tombstone is long finished — the worker's reads are deadlined.
-        this.tombs.delete(this.tombs.keys().next().value!);
+      const a = this.absent.get(addr);
+      if (!a) {
+        this.absent.set(addr, { count: 1, at: startedAt });
+      } else if (startedAt - a.at >= this.minAbsentIntervalMs) {
+        a.count++;
+        a.at = startedAt;
       }
+      if ((this.absent.get(addr)?.count ?? 0) < this.removeAfter) continue;
+      this.remove(addr);
       removed.push(addr);
     }
     return { changed, removed };
+  }
+
+  /** Addresses our own delete zome call reported deleted — exact, so they
+   *  go at once (with a tombstone). Answers those that were mounted. */
+  removeConfirmed(addrs: string[]): string[] {
+    const out: string[] = [];
+    for (const addr of addrs) {
+      if (!this.entries.has(addr)) continue;
+      this.remove(addr);
+      out.push(addr);
+    }
+    return out;
+  }
+
+  private remove(addr: string) {
+    this.entries.delete(addr);
+    this.seqOf.delete(addr);
+    this.absent.delete(addr);
+    this.tombs.set(addr, ++this.counter);
+    if (this.tombs.size > MAX_TOMBSTONES) {
+      // oldest first (insertion order); a read older than the evicted
+      // tombstone is long finished — the worker's reads are deadlined.
+      this.tombs.delete(this.tombs.keys().next().value!);
+    }
   }
 
   /** Every mounted record, as snapshot entries. */

@@ -76,8 +76,9 @@ test("a read that started before a removal cannot resurrect the record", () => {
   const s = new MountState();
   s.apply(outcome(10, "x"), s.beginRead());
   const stale = s.beginRead(); // a signal fetch starts…
-  const resync = s.beginRead(); // …a resync read starts, without OUT
-  const d = s.applySnapshot([], resync);
+  // …the record is removed (two complete absent reads, 15 s apart)
+  s.applySnapshot([], s.beginRead(), { startedAt: 0 });
+  const d = s.applySnapshot([], s.beginRead(), { startedAt: 15000 });
   assert.deepEqual(d.removed, [OUT]);
   assert.equal(s.apply(outcome(10, "x"), stale), false, "stale fetch resurrected");
   assert.equal(s.entries.has(OUT), false);
@@ -97,10 +98,69 @@ test("full resync keeps a newer mounted revision and records applied after it be
   assert.deepEqual(d.removed, []);
 });
 
-test("full resync removes records absent from a read that began after they mounted", () => {
+// ---- removal needs repeated complete absence (Lal round 3, F1) -----------
+//
+// The stock zomes give no deletion proof (B7): a list miss may be gossip
+// lag or a per-record error fetch_links dropped. A record is removed only
+// after it is absent from REMOVE_AFTER (2) consecutive COMPLETE full reads
+// started at least the resync interval (15 s) apart; an incomplete read
+// never advances the count; any sighting resets it.
+
+test("one complete absent read (e.g. a dropped per-record error) removes nothing", () => {
   const s = new MountState();
   s.apply(outcome(10, "x"), s.beginRead());
-  const d = s.applySnapshot([], s.beginRead());
-  assert.deepEqual(d.removed, [OUT]);
+  const d = s.applySnapshot([], s.beginRead(), { startedAt: 0 });
+  assert.deepEqual(d.removed, []);
+  assert.ok(s.entries.has(OUT));
+});
+
+test("two complete absent reads spaced by the resync interval remove it", () => {
+  const s = new MountState();
+  s.apply(outcome(10, "x"), s.beginRead());
+  assert.deepEqual(s.applySnapshot([], s.beginRead(), { startedAt: 1000 }).removed, []);
+  assert.deepEqual(s.applySnapshot([], s.beginRead(), { startedAt: 16000 }).removed, [OUT]);
   assert.equal(s.entries.size, 0);
+});
+
+test("absent reads closer than the interval count once", () => {
+  const s = new MountState();
+  s.apply(outcome(10, "x"), s.beginRead());
+  for (const t of [0, 3000, 9000, 14999]) {
+    assert.deepEqual(s.applySnapshot([], s.beginRead(), { startedAt: t }).removed, [], `t=${t}`);
+  }
+  assert.ok(s.entries.has(OUT));
+});
+
+test("missing, then present again, resets the count", () => {
+  const s = new MountState();
+  s.apply(outcome(10, "x"), s.beginRead());
+  s.applySnapshot([], s.beginRead(), { startedAt: 0 });
+  s.applySnapshot([outcome(10, "x")], s.beginRead(), { startedAt: 15000 });
+  assert.deepEqual(s.applySnapshot([], s.beginRead(), { startedAt: 30000 }).removed, []);
+  assert.ok(s.entries.has(OUT));
+  // a hint fetch that sees it also counts as present
+  s.apply(outcome(10, "x"), s.beginRead());
+  assert.deepEqual(s.applySnapshot([], s.beginRead(), { startedAt: 45000 }).removed, []);
+  assert.ok(s.entries.has(OUT));
+});
+
+test("incomplete reads never advance the absence count", () => {
+  const s = new MountState();
+  s.apply(outcome(10, "x"), s.beginRead());
+  for (const t of [0, 15000, 30000, 45000]) {
+    s.applySnapshot([], s.beginRead(), { startedAt: t, complete: false });
+  }
+  assert.ok(s.entries.has(OUT));
+  // the first COMPLETE absent read is only the first strike
+  assert.deepEqual(s.applySnapshot([], s.beginRead(), { startedAt: 60000 }).removed, []);
+  assert.ok(s.entries.has(OUT));
+});
+
+test("our own confirmed delete removes at once and tombstones", () => {
+  const s = new MountState();
+  s.apply(outcome(10, "x"), s.beginRead());
+  const stale = s.beginRead();
+  assert.deepEqual(s.removeConfirmed([OUT, "uhCkkNOTMOUNTED"]), [OUT]);
+  assert.equal(s.entries.has(OUT), false);
+  assert.equal(s.apply(outcome(10, "x"), stale), false);
 });
