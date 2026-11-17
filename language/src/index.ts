@@ -2,6 +2,7 @@ import {
   holochainRegisterDnas,
   holochainCall,
   agentDid,
+  emitSignal,
   languageAddress,
 } from "ad4m:host";
 import {
@@ -12,6 +13,7 @@ import {
 } from "./holo";
 import { isClassName, mountShapesFor } from "./shapes";
 import { lastSnapshot, takeSnapshot } from "./snapshot";
+import { decodeSignalEnvelope, signalToDelta } from "./signals";
 import {
   createParameters,
   createRecord,
@@ -58,36 +60,31 @@ export function isPublic(): boolean {
   return false;
 }
 
-// B4 capture: log the raw shape of one Holochain signal so the decoder can be
-// written against fact, not assumption (design R11). Uint8Array previews as
-// {__u8: len, head: [..]} so JSON.stringify stays readable.
+// B4: an Acorn remote signal becomes a mount delta (design §1.5). The
+// executor hands us { cell_id, zome_name, payload } with payload still
+// msgpack (test/fixtures/raw-signal.md); decode, map, fold into the last
+// snapshot, and push the delta — every perspective mounting this language
+// applies it (ad4m_signal_emitted's mountDelta branch). The signal's own
+// writes echo back through this path too (get_peers includes the sender)
+// and are a no-op: applying a delta is a diff.
 export async function handleHolochainSignal(signal: any): Promise<void> {
   try {
-    const p = signal?.payload;
-    const preview = JSON.stringify(signal, (_k, v) =>
-      v instanceof Uint8Array
-        ? { __u8: v.length, head: Array.from(v.slice(0, 60)) }
-        : v
-    )?.slice(0, 3000);
-    console.warn(
-      "ACORN_RAW_SIGNAL " +
-        JSON.stringify({
-          keys: signal == null ? signal : Object.keys(signal),
-          payloadType:
-            p instanceof Uint8Array
-              ? `Uint8Array(${p.byteLength})`
-              : p === null
-                ? "null"
-                : Array.isArray(p)
-                  ? "array"
-                  : typeof p,
-          payloadHead:
-            p instanceof Uint8Array ? Array.from(p.slice(0, 200)) : undefined,
-          preview,
-        })
-    );
+    const decoded = decodeSignalEnvelope(signal?.payload);
+    if (!decoded) return;
+    const delta = signalToDelta(decoded, {
+      lang: languageAddress(),
+      snapshot: lastSnapshot,
+    });
+    if (!delta) return;
+    for (const e of delta.changed) {
+      lastSnapshot.set(e.address, { class: e.class, data: e.data });
+    }
+    for (const a of delta.removed) {
+      lastSnapshot.delete(a);
+    }
+    emitSignal({ mountDelta: delta });
   } catch (e) {
-    console.warn("ACORN_RAW_SIGNAL error", String(e));
+    console.error("handleHolochainSignal:", e);
   }
 }
 

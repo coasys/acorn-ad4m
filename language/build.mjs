@@ -26,6 +26,9 @@ await build({
   bundle: true,
   format: "esm",
   platform: "neutral",
+  // neutral picks no mainFields by default; @msgpack/msgpack ships its ESM
+  // build under "module" — prefer it so the bundle stays ESM for Deno.
+  mainFields: ["module", "main"],
   target: "es2022",
   external: ["ad4m:host"],
   outfile: join(HERE, "build", "bundle.js"),

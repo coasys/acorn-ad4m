@@ -16,5 +16,6 @@ declare module "ad4m:host" {
     params: any
   ): Promise<any>;
   export function agentDid(): string;
+  export function emitSignal(data: any): void;
   export function languageAddress(): string;
 }

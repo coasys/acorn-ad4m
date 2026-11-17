@@ -227,6 +227,7 @@ export function signalToDelta(decoded: any, ctx: SignalCtx): MountDelta | null {
       ...(inner.deletedConnections ?? []),
       ...(inner.deletedOutcomeMembers ?? []),
       ...(inner.deletedOutcomeComments ?? []),
+      ...(inner.deletedOutcomeVotes ?? []),
       ...(inner.deletedEntryPoints ?? []),
     ].filter((h): h is string => typeof h === "string");
     const derived = derivedFrom(conns);
