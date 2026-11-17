@@ -1,0 +1,11 @@
+{
+  "name": "acorn-ad4m-rig",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Two-node rig: stock Holochain conductor + AD4M executor on a local kitsune2 bootstrap",
+  "dependencies": {
+    "@holochain/client": "0.21.1",
+    "ws": "8.18.3"
+  }
+}
