@@ -102,6 +102,10 @@ interface Dirty extends HintTarget {
   /** when the worker could first act on it: re-hints extend the deadline
    *  to at most firstAt + 3 budgets (Lal round 3, F3) */
   firstAt: number;
+  /** MountState seq taken when last hinted (Lal round 4): only a read
+   *  that STARTED after it may resolve the record — a reused older read
+   *  can apply data (the guard orders it) but leaves the record dirty */
+  hintSeq: number;
   nextAt: number;
 }
 
@@ -210,6 +214,7 @@ export class Reconciler {
       const d = this.queue.get(key);
       if (d) {
         d.gen++;
+        d.hintSeq = this.o.state.beginRead();
         if (t.create) d.create = true;
         else d.updates++;
         d.want = Math.max(d.want, claimed);
@@ -246,6 +251,7 @@ export class Reconciler {
         updates: t.create ? 0 : 1,
         want: claimed,
         gen: 0,
+        hintSeq: this.o.state.beginRead(),
         deadline: this.started ? now + this.budgetMs : 0,
         firstAt: now,
         nextAt: now,
@@ -419,6 +425,9 @@ export class Reconciler {
     const rows = new Map<FetchKind, any[] | null>(got.map(([k, r]) => [k, r.rows]));
     const seqs = got.filter(([, r]) => r.rows).map(([, r]) => r.seq);
     const seq = seqs.length ? Math.min(...seqs) : this.o.state.beginRead();
+    const readSeq = new Map<FetchKind, number>(
+      got.filter(([, r]) => r.rows).map(([k, r]) => [k, r.seq])
+    );
 
     // Lal round 3, F2: connections first, through the guard; then every
     // derived edge comes from the MOUNTED connections — a stale connection
@@ -447,8 +456,11 @@ export class Reconciler {
     const after = Date.now();
     for (const d of due) {
       if (this.queue.get(d.key) !== d) continue;
-      if (done.get(d) && d.gen === gens.get(d)) this.queue.delete(d.key);
-      else d.nextAt = d.gen !== gens.get(d) ? after : after + this.retryMs;
+      // resolvable only by a read of its collection that began after its
+      // latest hint (a reused, older read cannot discharge a newer hint)
+      const fresh = (readSeq.get(d.kind) ?? 0) > d.hintSeq;
+      if (done.get(d) && fresh && d.gen === gens.get(d)) this.queue.delete(d.key);
+      else d.nextAt = d.gen !== gens.get(d) || (done.get(d) && !fresh) ? after : after + this.retryMs;
     }
     if (changed.size) this.o.emit({ changed: [...changed.values()], removed: [] });
   }

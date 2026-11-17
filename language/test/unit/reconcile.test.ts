@@ -385,3 +385,51 @@ test("re-hints cannot keep a record dirty forever (F3)", async () => {
   assert.ok(r.stats.expired >= 1, "re-hints kept one dirty record alive for 300 ms (budget 40)");
   await idleWithin(r, 1000);
 });
+
+// ---- reused reads vs newer hints (Lal round 4, P2-1) -----------------------
+
+test("a reused read older than a hint cannot resolve it; a fresh read does (round 4)", async () => {
+  // B is mounted at v10. A's create hint starts a read that times out but
+  // stays outstanding. B then gets an update hint (claim v30). The next
+  // pass REUSES the old read, which answers B at v20 — newer than mounted
+  // and within the claim's 1 s tolerance — so it may apply, but B must
+  // stay dirty until a read started after its hint: that one shows v30.
+  const B = addr(2);
+  const state = new MountState();
+  state.apply(
+    { class: "AcornOutcome", address: B, data: { recordUpdatedAt: REV0 + 10, content: "v10" } },
+    state.beginRead()
+  );
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  let calls = 0;
+  const r = new Reconciler({
+    lang: LANG,
+    state,
+    fetch: async (kind: string) => {
+      if (kind !== "outcomes") return [];
+      if (++calls === 1) {
+        await gate;
+        return [outcome(addr(1), REV0), outcome(B, REV0 + 20)];
+      }
+      return [outcome(addr(1), REV0), outcome(B, REV0 + 30)];
+    },
+    emit: () => {},
+    resync: async () => ({ changed: [], removed: [] }),
+    budgetMs: 3000,
+    retryMs: 40,
+    fetchTimeoutMs: 15,
+  });
+  r.start();
+  r.hint(hint("create", outcome(addr(1), REV0)));
+  await sleep(25); // pass 1 timed out; its read is still outstanding
+  assert.equal(calls, 1);
+  r.hint(hint("update", outcome(B, REV0 + 30)));
+  // release the old read once the next pass is waiting on it
+  const passes = r.stats.passes;
+  while (r.stats.passes === passes) await sleep(1);
+  release();
+  await idleWithin(r, 2000);
+  assert.ok(calls >= 2, "no fresh read after B's hint — B was resolved by the reused read");
+  assert.equal(state.entries.get(B)?.data.content, `v${REV0 + 30}`);
+});
