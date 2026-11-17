@@ -181,6 +181,18 @@ function classIri(name: ClassName): string {
   return `acorn://${name.slice("Acorn".length)}`;
 }
 
+/** Whether `name` is one of the nine Acorn classes. */
+export function isClassName(name: string): name is ClassName {
+  return (CLASS_NAMES as readonly string[]).includes(name);
+}
+
+/** The non-read-only property names of a class — what `create` and `update`
+ *  may accept (a read-only prop in the params is dropped). */
+export function writablePropNames(name: string): string[] {
+  const def = CLASSES[name as ClassName];
+  return def ? def.props.filter((p) => !p.ro).map((p) => p.name) : [];
+}
+
 function propShape(p: Prop): Record<string, unknown> {
   const shape: Record<string, unknown> = {
     path: `acorn://${p.name}`,

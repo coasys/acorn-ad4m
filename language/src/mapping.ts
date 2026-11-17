@@ -5,6 +5,7 @@
 // fields of the other `scope` variant must not appear at all).
 
 import { agentToDid } from "./agent";
+import { writablePropNames } from "./shapes";
 
 /** Derived outcome tree edges from the connections of the same snapshot. */
 export interface Derived {
@@ -193,4 +194,192 @@ export function toData(
   }
 
   return data;
+}
+
+// --- mount data -> Acorn entries (B3 write side) ---------------------------
+//
+// toEntry is the exact inverse of toData: `<lang>://<hash>` URLs become
+// ActionHashB64 again, did:key agents become AgentPubKeyB64, scopeType + the
+// flattened scope fields rebuild the externally tagged `scope` enum, and the
+// JSON-string `taskList`/`timeFrame` parse back to values. Everything that is
+// not an entry field — WireRecord metadata, derived parent/children — is
+// dropped.
+
+export interface ToEntryCtx {
+  /** this language's address; refs arrive as `<lang>://<hash>` */
+  lang: string;
+  didToAgent: (did: string) => string;
+  /** project network seed: the ONLY source of ProjectMeta.passphrase */
+  seed?: string;
+}
+
+/** "uid-a-b-c-d-e" -> "a b c d e" — the inverse of Acorn's uidToPassphrase
+ *  (web/src/secrets.ts:8-9), so the stock UI's passphrase convention holds. */
+export function seedToPassphrase(seed: string): string {
+  return (seed.startsWith("uid-") ? seed.slice(4) : seed).split("-").join(" ");
+}
+
+/** `<lang>://<hash>` -> `<hash>`; a bare hash passes through unchanged. */
+export function urlToHash(url: unknown, lang: string): string {
+  const s = String(url);
+  const prefix = `${lang}://`;
+  return s.startsWith(prefix) ? s.slice(prefix.length) : s;
+}
+
+// did:key -> AgentPubKeyB64; a raw key passes through unchanged.
+function agentValue(v: unknown, ctx: ToEntryCtx): string | null {
+  if (v === null || v === undefined) return null;
+  const s = String(v);
+  return s.startsWith("did:") ? ctx.didToAgent(s) : s;
+}
+
+// A mounted JSON-string field ("[...]", "{...}") parses back to its value;
+// anything already a value passes through.
+function jsonValue(v: unknown): unknown {
+  if (v === null || v === undefined) return null;
+  if (typeof v !== "string") return v;
+  try {
+    return JSON.parse(v);
+  } catch {
+    return v;
+  }
+}
+
+function scopeToEntry(data: Record<string, unknown>): Record<string, unknown> {
+  if (data.scopeType === "Small") {
+    return {
+      Small: {
+        achievementStatus: data.achievementStatus ?? "NotAchieved",
+        targetDate: data.targetDate ?? null,
+        taskList: jsonValue(data.taskList) ?? [],
+      },
+    };
+  }
+  return {
+    Uncertain: {
+      smallsEstimate: data.smallsEstimate ?? null,
+      timeFrame: jsonValue(data.timeFrame),
+      inBreakdown: data.inBreakdown ?? false,
+    },
+  };
+}
+
+export function toEntry(
+  className: string,
+  data: Record<string, unknown>,
+  ctx: ToEntryCtx
+): Record<string, unknown> {
+  const ref = (v: unknown) => (v == null ? null : urlToHash(v, ctx.lang));
+  const agent = (v: unknown) => agentValue(v, ctx);
+  const num = (v: unknown) => (typeof v === "number" ? v : 0);
+  const str = (v: unknown) => (typeof v === "string" ? v : "");
+  const refs = (v: unknown): string[] =>
+    Array.isArray(v)
+      ? v.map((x) => ref(x)).filter((x): x is string => x != null)
+      : [];
+
+  switch (className) {
+    case "AcornOutcome":
+      return {
+        content: str(data.content),
+        creatorAgentPubKey: agent(data.creator),
+        editorAgentPubKey: agent(data.editor),
+        timestampCreated: num(data.timestampCreated),
+        timestampUpdated: data.timestampUpdated ?? null,
+        scope: scopeToEntry(data),
+        tags: refs(data.tags),
+        description: str(data.description),
+        isImported: data.isImported === true,
+        githubLink: str(data.githubLink),
+      };
+    case "AcornConnection":
+      return {
+        parentActionHash: ref(data.parent),
+        childActionHash: ref(data.child),
+        siblingOrder: num(data.siblingOrder),
+        randomizer: num(data.randomizer),
+        isImported: data.isImported === true,
+      };
+    case "AcornEntryPoint":
+      return {
+        color: str(data.color),
+        creatorAgentPubKey: agent(data.creator),
+        createdAt: num(data.createdAtTime),
+        outcomeActionHash: ref(data.outcome),
+        isImported: data.isImported === true,
+      };
+    case "AcornOutcomeComment":
+      return {
+        outcomeActionHash: ref(data.outcome),
+        content: str(data.content),
+        creatorAgentPubKey: agent(data.creator),
+        unixTimestamp: num(data.unixTimestamp),
+        isImported: data.isImported === true,
+      };
+    case "AcornOutcomeMember":
+      return {
+        outcomeActionHash: ref(data.outcome),
+        memberAgentPubKey: agent(data.member),
+        creatorAgentPubKey: agent(data.creator),
+        unixTimestamp: num(data.unixTimestamp),
+        isImported: data.isImported === true,
+      };
+    case "AcornTag":
+      return {
+        backgroundColor: str(data.backgroundColor),
+        text: str(data.text),
+      };
+    case "AcornProjectMeta":
+      return {
+        creatorAgentPubKey: agent(data.creator),
+        createdAt: num(data.createdAtTime),
+        name: str(data.name),
+        image: data.image ?? null,
+        // The project passphrase is derived from the language seed — it is
+        // never mounted data and never accepted from interaction params.
+        passphrase:
+          typeof data.passphrase === "string" && data.passphrase !== ""
+            ? data.passphrase
+            : seedToPassphrase(ctx.seed ?? ""),
+        isImported: data.isImported === true,
+        layeringAlgorithm: str(data.layeringAlgorithm),
+        topPriorityOutcomes: refs(data.topPriorityOutcomes),
+        isMigrated: data.isMigrated ?? null,
+      };
+    case "AcornMember":
+      return { agentPubKey: agent(data.agent) };
+    case "AcornProfile":
+      return {
+        firstName: str(data.firstName),
+        lastName: str(data.lastName),
+        handle: str(data.handle),
+        status: str(data.status),
+        avatarUrl: str(data.avatarUrl),
+        agentPubKey:
+          typeof data.agentPubKey === "string" && data.agentPubKey !== ""
+            ? data.agentPubKey
+            : agent(data.agent),
+        isImported: data.isImported === true,
+      };
+    default:
+      throw new Error(`toEntry: unknown class ${className}`);
+  }
+}
+
+/** The merge half of update's read-modify-write (design §3.3): the current
+ *  entry maps to mount data, `params` — only the shape's writable properties —
+ *  overlay it, and the result maps back to a complete new entry. Read-only
+ *  props in `params` are dropped, so only the changed keys can differ. */
+export function mergeForUpdate(
+  className: string,
+  currentEntry: any,
+  params: Record<string, unknown>,
+  ctx: MapCtx & ToEntryCtx
+): Record<string, unknown> {
+  const data = toData(className, currentEntry, ctx);
+  const merged = { ...data };
+  for (const name of writablePropNames(className)) {
+    if (params[name] !== undefined) merged[name] = params[name];
+  }
+  return toEntry(className, merged, ctx);
 }
