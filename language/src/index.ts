@@ -11,6 +11,8 @@ import {
   deepDecode,
   deepEncode,
 } from "./holo";
+import { agentToDid } from "./agent";
+import { toData } from "./mapping";
 import { isClassName, mountShapesFor } from "./shapes";
 import { lastSnapshot, takeSnapshot } from "./snapshot";
 import { decodeSignalEnvelope, signalToDelta } from "./signals";
@@ -146,22 +148,53 @@ function cellIdB64(): [string, string] | null {
   return [bytesToB64(id[0]), bytesToB64(id[1])];
 }
 
+// The language cell's own Holochain agent key (AgentPubKeyB64): the AD4M
+// user's Acorn identity — `did:key` of these 32 bytes is what other users
+// see as `creator`/`agent` (design §5.3).
+function ownAgentKey(): string {
+  return (
+    cellIdB64()?.[1] ??
+    (appInfo?.agent_pub_key ? bytesToB64(appInfo.agent_pub_key) : "")
+  );
+}
+
 async function info(): Promise<any> {
   const cell = cellIdB64();
+  const key = ownAgentKey();
   return {
     dnaHash: cell ? cell[0] : null,
-    agentPubKey: cell ? cell[1] : bytesToB64(appInfo?.agent_pub_key),
-    agentDid: null, // filled in B5
+    agentPubKey: key || null,
+    agentDid: key ? agentToDid(key) : null,
     ad4mDid: agentDid(),
     seed,
     cellId: cell,
   };
 }
 
+// `whoami` answers the own Acorn profile in the mount's shape —
+// { address: "profile/<own key>", data } or null until create_whoami ran
+// (the UI's setProjectWhoami, installProject.ts).
+async function projectWhoami(): Promise<any> {
+  const key = ownAgentKey();
+  if (!key) return null;
+  const wr = await holochainCall(NICK, "profiles", "whoami", {
+    input: null,
+    local: true,
+  });
+  if (!wr) return null;
+  const lang = languageAddress();
+  const data = toData("AcornProfile", wr.entry, {
+    lang,
+    hashToUrl: (h) => `${lang}://${h}`,
+    agentToDid,
+  });
+  return { address: `profile/${key}`, data };
+}
+
 function writeCtx(): WriteCtx {
   return {
     lang: languageAddress(),
-    ownAgent: cellIdB64()?.[1] ?? "",
+    ownAgent: ownAgentKey(),
     seed,
   };
 }
@@ -174,6 +207,43 @@ export async function interactions(address: string): Promise<Interaction[]> {
         label: "Acorn project cell info",
         parameters: [],
         execute: () => info(),
+      },
+      {
+        name: "whoami",
+        label: "The own Acorn profile in this project",
+        parameters: [],
+        execute: () => projectWhoami(),
+      },
+      {
+        name: "sendRealtimeInfo",
+        label: "Send realtime presence info to project peers",
+        parameters: [
+          { name: "projectId", type: "string" },
+          { name: "outcomeBeingEdited", type: "object" },
+          { name: "outcomeExpandedView", type: "string" },
+        ],
+        // params pass through verbatim — they ARE the zome's
+        // RealtimeInfoInput (projects/src/lib.rs:152).
+        execute: async (p: any) => {
+          await holochainCall(
+            NICK,
+            "projects",
+            "emit_realtime_info_signal",
+            p ?? null
+          );
+          return null;
+        },
+      },
+      {
+        name: "announceJoin",
+        label: "Signal project peers that we joined",
+        parameters: [],
+        // the UI's triggerJoinSignal (joinProject.ts): init_signal sends a
+        // Member signal to every peer so they learn we are here.
+        execute: async () => {
+          await holochainCall(NICK, "projects", "init_signal", null);
+          return null;
+        },
       },
     ];
     if (ACORN_DEBUG_CALL) {
