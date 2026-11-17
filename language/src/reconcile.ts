@@ -49,6 +49,7 @@ import {
   type MapCtx,
 } from "./mapping";
 import { hintTargets, type FetchKind, type HintTarget } from "./signals";
+import { CallPool } from "./pool";
 import { MountState, type MountDelta, type SnapshotEntry } from "./state";
 
 const CLAIM_TOLERANCE_US = 1_000_000;
@@ -72,6 +73,12 @@ export interface ReconcilerOpts {
   /** host calls (collection reads) allowed outstanding until they SETTLE
    *  — a timed-out call still counts (default 9, one per collection) */
   maxOutstanding?: number;
+  /** the host-call pool to read through (pool.ts; the language passes the
+   *  one it shares with full snapshots — Lal round 4, P2-2); default a
+   *  private pool of maxOutstanding */
+  pool?: CallPool;
+  /** first overflow retry backoff (default 1000 ms) */
+  backoffMinMs?: number;
   /** deadline for the overflow resync (default 30 000 ms) */
   overflowTimeoutMs?: number;
 }
@@ -82,7 +89,6 @@ export interface ResyncFence {
   stale(): boolean;
 }
 
-const BACKOFF_MIN_MS = 1000;
 const BACKOFF_MAX_MS = 60000;
 const LIFETIME_BUDGETS = 3;
 
@@ -140,10 +146,10 @@ export class Reconciler {
   private readonly budgetMs: number;
   private readonly retryMs: number;
   private readonly fetchTimeoutMs: number;
-  private readonly maxOutstanding: number;
   private readonly overflowTimeoutMs: number;
+  private readonly backoffMinMs: number;
   /** collection reads started and not yet settled, with their read seq */
-  private readonly calls = new Map<FetchKind, { p: Promise<unknown>; seq: number }>();
+  private readonly pool: CallPool;
   /** the overflow resync started and not yet settled */
   private resyncCall: Promise<unknown> | null = null;
   private backoffMs = 0;
@@ -155,8 +161,9 @@ export class Reconciler {
     this.budgetMs = Math.max(1, o.budgetMs ?? 13000);
     this.retryMs = Math.max(0, o.retryMs ?? 650);
     this.fetchTimeoutMs = Math.max(1, o.fetchTimeoutMs ?? 10000);
-    this.maxOutstanding = Math.max(1, o.maxOutstanding ?? 9);
+    this.pool = o.pool ?? new CallPool(Math.max(1, o.maxOutstanding ?? 9));
     this.overflowTimeoutMs = Math.max(1, o.overflowTimeoutMs ?? 30000);
+    this.backoffMinMs = Math.max(1, o.backoffMinMs ?? 1000);
   }
 
   /** dirty records waiting for the worker */
@@ -329,7 +336,7 @@ export class Reconciler {
     stale = true;
     this.dropCovered = false;
     this.stats.resyncFailures++;
-    this.backoffMs = Math.min(BACKOFF_MAX_MS, Math.max(BACKOFF_MIN_MS, this.backoffMs * 2));
+    this.backoffMs = Math.min(BACKOFF_MAX_MS, Math.max(this.backoffMinMs, this.backoffMs * 2));
     this.resyncNotBefore = Date.now() + this.backoffMs;
     this.overflowPending = true; // still owed
   }
@@ -362,34 +369,25 @@ export class Reconciler {
 
   /** collection reads started and not yet settled */
   get outstanding(): number {
-    return this.calls.size;
+    return this.pool.size;
   }
 
   // One collection read, bounded (F3): a read of that collection still
   // outstanding from an earlier pass (timed out but not settled) is
   // awaited again instead of starting another host call; no new call
-  // starts while maxOutstanding are unsettled. Answers the rows (null =
+  // starts while the pool is full (pool.ts). Answers the rows (null =
   // inconclusive) and the seq of the read actually used.
   private async fetchBounded(
     kind: FetchKind,
     ms: number
   ): Promise<{ rows: any[] | null; seq: number }> {
-    let call = this.calls.get(kind);
-    if (!call) {
-      if (this.calls.size >= this.maxOutstanding) return { rows: null, seq: 0 };
-      this.stats.fetches++;
-      const seq = this.o.state.beginRead();
-      const p = Promise.resolve().then(() => this.o.fetch(kind));
-      const c = { p, seq };
-      this.calls.set(kind, c);
-      p.then(
-        () => {},
-        () => {}
-      ).finally(() => {
-        if (this.calls.get(kind) === c) this.calls.delete(kind);
-      });
-      call = c;
-    }
+    const call = this.pool.run(
+      `network:${kind}`,
+      () => this.o.fetch(kind),
+      () => this.o.state.beginRead()
+    );
+    if (!call) return { rows: null, seq: 0 };
+    if (!call.reused) this.stats.fetches++;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const res = await Promise.race([

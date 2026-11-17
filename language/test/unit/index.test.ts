@@ -37,13 +37,16 @@ export const languageAddress = () => h().languageAddress();
 `;
 
 // A fresh copy of the language module (its module state is per import).
-async function loadLanguage(defines: Record<string, string> = {}): Promise<any> {
+async function loadLanguage(
+  defines: Record<string, string> = {},
+  entry = join(HERE, "..", "..", "src", "index.ts")
+): Promise<any> {
   const dir = mkdtempSync(join(tmpdir(), "acorn-index-"));
   const stub = join(dir, "host.mjs");
   writeFileSync(stub, HOST_STUB);
   const out = join(dir, "index.mjs");
   await build({
-    entryPoints: [join(HERE, "..", "..", "src", "index.ts")],
+    entryPoints: [entry],
     bundle: true,
     format: "esm",
     platform: "neutral",
@@ -321,4 +324,40 @@ test("a full read missing a mounted connection keeps the outcomes' edges", async
   assert.equal(b?.data.parent, `${LANG}://${OUTCOME_A}`, "B.parent erased by an incomplete list");
   assert.deepEqual(a?.data.children, [`${LANG}://${OUTCOME_B}`]);
   assert.ok(entries.some((e: any) => e.address === CONNECTION_AB), "connection removed on one read");
+});
+
+// ---- overflow/resync snapshots cannot leak unsettled calls (Lal round 4, P2-2)
+//
+// One collection rejects (the aggregate read fails fast) while another
+// never settles. Retrying the full read — as the overflow backoff does —
+// must not start a new host call for the collection still hung.
+
+test("failed full reads with a hung sibling start no new call for it across retries", async () => {
+  const counts: Record<string, number> = {};
+  let unsettled = 0;
+  (globalThis as any).__acornHost = {
+    holochainRegisterDnas: async () => [{}],
+    agentDid: () => "did:key:zTestExecutor",
+    languageAddress: () => LANG,
+    emitSignal: () => {},
+    holochainCall: (_n: string, _z: string, fn: string) => {
+      counts[fn] = (counts[fn] ?? 0) + 1;
+      if (fn === "fetch_tags") return Promise.reject(new Error("tags: source chain error"));
+      if (fn === "fetch_outcome_comments") {
+        unsettled++;
+        return new Promise(() => {}); // hung
+      }
+      return Promise.resolve(fn === "fetch_project_meta" ? null : []);
+    },
+  };
+  const dir = mkdtempSync(join(tmpdir(), "acorn-snap-"));
+  const entry = join(dir, "entry.ts");
+  writeFileSync(entry, `export * from ${JSON.stringify(join(HERE, "..", "..", "src", "snapshot.ts"))};`);
+  const mod = await loadLanguage({}, entry);
+  for (let i = 0; i < 4; i++) {
+    await assert.rejects(mod.resyncSnapshot(LANG, {}, { complete: false }), /tags/);
+  }
+  assert.equal(counts.fetch_outcome_comments, 1, "a new call started for the hung collection");
+  assert.equal(unsettled, 1);
+  assert.equal(counts.fetch_tags, 4, "the rejected collection is re-read on each retry");
 });

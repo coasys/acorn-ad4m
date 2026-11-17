@@ -433,3 +433,32 @@ test("a reused read older than a hint cannot resolve it; a fresh read does (roun
   assert.ok(calls >= 2, "no fresh read after B's hint — B was resolved by the reused read");
   assert.equal(state.entries.get(B)?.data.content, `v${REV0 + 30}`);
 });
+
+test("a failing overflow resync is retried with backoff, never two at once (round 4)", async () => {
+  let resyncs = 0;
+  let running = 0;
+  let maxRunning = 0;
+  const r = new Reconciler({
+    lang: LANG,
+    state: new MountState(),
+    fetch: async () => [],
+    emit: () => {},
+    resync: async () => {
+      resyncs++;
+      running++;
+      maxRunning = Math.max(maxRunning, running);
+      await sleep(5);
+      running--;
+      throw new Error("tags: source chain error");
+    },
+    maxPending: 2,
+    budgetMs: 30,
+    overflowTimeoutMs: 50,
+    backoffMinMs: 10,
+  } as any);
+  r.start();
+  for (let i = 0; i < 5; i++) r.hint(hint("create", outcome(addr(i), REV0)));
+  await sleep(300);
+  assert.ok(resyncs >= 3, `owed resync retried only ${resyncs}x`);
+  assert.equal(maxRunning, 1, "resyncs stacked");
+});

@@ -18,6 +18,7 @@ import { lastSnapshot, mountState } from "./state";
 import { resyncSnapshot, takeSnapshot } from "./snapshot";
 import { decodeSignalEnvelope, FETCH_SPEC, type FetchKind } from "./signals";
 import { Reconciler } from "./reconcile";
+import { sharedPool } from "./pool";
 import {
   createParameters,
   createRecord,
@@ -115,6 +116,8 @@ function reconciler(): Reconciler {
         })
       ).delta,
     identity: snapshotIdentity,
+    // shared with every snapshot's reads (Lal round 4, P2-2)
+    pool: sharedPool,
   });
   return worker;
 }

@@ -1,6 +1,9 @@
 // mountSnapshot(): every Acorn record of the project as mount entries
 // (design §4.3). Nine reads in one Promise.all — the language's call queue
-// is shared with writes, so the snapshot must stay fast (R6). The result
+// is shared with writes, so the snapshot must stay fast (R6). The reads go
+// through the language's host-call pool (pool.ts, Lal round 4 P2-2): a
+// collection whose earlier call has not settled — a failed snapshot's hung
+// sibling — is awaited again, never called a second time. The result
 // is merged into the module-level mount state (state.ts) through its
 // revision guard; the merged mount is what mountSnapshot answers.
 
@@ -13,6 +16,7 @@ import {
   toData,
   type MapCtx,
 } from "./mapping";
+import { sharedPool } from "./pool";
 import {
   mountState,
   type MountDelta,
@@ -42,16 +46,15 @@ function isNoProjectMeta(e: unknown): boolean {
 // `complete: false` marks a read whose absences must not count toward
 // removal (the worker's overflow fallback — Lal round 3, F1); a `fence`
 // that turned stale while reading (the worker's deadline passed — F3)
-// makes the read apply nothing. Answers the
+// makes the read apply nothing. A read reusing an older pooled call is
+// ordered by the OLDEST call it used (seq and start time). Answers the
 // whole mount after the merge plus the delta the merge made.
 export async function resyncSnapshot(
   lang: string,
   own: SnapshotIdentity = {},
   opts: { complete?: boolean; fence?: { stale(): boolean } } = {}
 ): Promise<{ entries: SnapshotEntry[]; delta: MountDelta; seq: number }> {
-  const seq = mountState.beginRead();
-  const startedAt = Date.now();
-  const { others, outcomes, ctx } = await readSnapshot(lang, own);
+  const { others, outcomes, ctx, seq, startedAt } = await readSnapshot(lang, own);
   if (opts.fence?.stale()) {
     // the worker gave up on this (overflow) read: it applies nothing
     return { entries: mountState.list(), delta: { changed: [], removed: [] }, seq };
@@ -98,12 +101,48 @@ export async function takeSnapshot(
   return { entries };
 }
 
+// One collection read through the pool; a full pool fails the snapshot.
+function pooled(
+  zome: string,
+  fn: string,
+  payload: unknown,
+  readSeq: () => number,
+  used: { seq: number; startedAt: number }[],
+  orNull?: (e: unknown) => boolean
+): Promise<any> {
+  const call = sharedPool.run(
+    `local:${zome}/${fn}`,
+    () =>
+      holochainCall(NICK, zome, fn, payload).catch((e) => {
+        if (orNull?.(e)) return null;
+        throw e;
+      }),
+    readSeq
+  );
+  if (!call) return Promise.reject(new Error(`acorn snapshot: host-call pool full (${fn})`));
+  used.push(call);
+  return call.p;
+}
+
 // Every Acorn record of the project — reads only. Outcomes come back raw:
 // their derived edges are computed against the mount (resyncSnapshot).
+// `seq`/`startedAt` are those of the oldest call read.
 async function readSnapshot(
   lang: string,
   own: SnapshotIdentity
-): Promise<{ others: SnapshotEntry[]; outcomes: any[]; ctx: MapCtx }> {
+): Promise<{
+  others: SnapshotEntry[];
+  outcomes: any[];
+  ctx: MapCtx;
+  seq: number;
+  startedAt: number;
+}> {
+  // one seq for every call this snapshot starts, taken before the first
+  let fresh: number | undefined;
+  const readSeq = () => (fresh ??= mountState.beginRead());
+  const used: { seq: number; startedAt: number }[] = [];
+  const read = (zome: string, fn: string, payload: unknown, orNull?: (e: unknown) => boolean) =>
+    pooled(zome, fn, payload, readSeq, used, orNull);
   const [
     outcomes,
     connections,
@@ -115,24 +154,21 @@ async function readSnapshot(
     members,
     profiles,
   ] = await Promise.all([
-    holochainCall(NICK, "projects", "fetch_outcomes", FETCH_ALL),
-    holochainCall(NICK, "projects", "fetch_connections", FETCH_ALL),
-    holochainCall(NICK, "projects", "fetch_entry_points", FETCH_ALL),
-    holochainCall(NICK, "projects", "fetch_outcome_comments", FETCH_ALL),
-    holochainCall(NICK, "projects", "fetch_outcome_members", FETCH_ALL),
-    holochainCall(NICK, "projects", "fetch_tags", FETCH_ALL),
+    read("projects", "fetch_outcomes", FETCH_ALL),
+    read("projects", "fetch_connections", FETCH_ALL),
+    read("projects", "fetch_entry_points", FETCH_ALL),
+    read("projects", "fetch_outcome_comments", FETCH_ALL),
+    read("projects", "fetch_outcome_members", FETCH_ALL),
+    read("projects", "fetch_tags", FETCH_ALL),
     // fetch_project_meta throws "no project meta exists" until one is
     // written; that is "no entry", not a snapshot failure.
-    holochainCall(NICK, "projects", "fetch_project_meta", FETCH_NONE).catch(
-      (e) => {
-        if (isNoProjectMeta(e)) return null;
-        throw e;
-      }
-    ),
-    holochainCall(NICK, "projects", "fetch_members", FETCH_NONE),
+    read("projects", "fetch_project_meta", FETCH_NONE, isNoProjectMeta),
+    read("projects", "fetch_members", FETCH_NONE),
     // fetch_agents returns bare Profiles (no WireRecord) — Correction 6.
-    holochainCall(NICK, "profiles", "fetch_agents", FETCH_NONE),
+    read("profiles", "fetch_agents", FETCH_NONE),
   ]);
+  const seq = Math.min(...used.map((c) => c.seq));
+  const startedAt = Math.min(...used.map((c) => c.startedAt));
 
   const ctx: MapCtx = {
     lang,
@@ -158,5 +194,5 @@ async function readSnapshot(
   for (const r of members ?? []) push("AcornMember", r);
   for (const p of profiles ?? []) push("AcornProfile", p);
 
-  return { others, outcomes: outcomes ?? [], ctx };
+  return { others, outcomes: outcomes ?? [], ctx, seq, startedAt };
 }
