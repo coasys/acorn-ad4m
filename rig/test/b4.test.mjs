@@ -1,17 +1,23 @@
 // B4 rig tests — a stock-side change must reach the AD4M mount through the
-// Acorn remote signal -> mountDelta push path, not gossip + the 15 s resync
-// (stock->AD4M DHT visibility can take minutes or never arrive — step 0).
-// Every fixture record is therefore created AFTER the mount: its own create
-// signal is what lands it in the mount, and the polls that await it would
-// take far longer than the push needs if the signal path were broken.
+// Acorn remote signal -> mountDelta push path. Every fixture record is
+// created AFTER the mount: its own create signal is what lands it.
 //
-//   1. stock creates + renames an outcome -> perspective.modelSubscribe on
-//      AcornOutcome delivers the new content in under 3 s (resync is 15 s,
-//      so a pass proves the push worked). Prints `push latency: <n> ms`.
-//   2. stock delete_outcome_fully on an outcome with a connection and a
-//      comment -> within 20 s modelQuery no longer has any of the three,
-//      without a syncMount. The child outcome survives (the zome call only
-//      deletes connections that touch the deleted outcome).
+// B7 (Lal round 2, #5): a latency bound alone cannot prove push — the
+// executor's 15 s periodic resync (fixed in the binary) delivers the same
+// change, and its next tick can fall anywhere in the window. So:
+//
+//   1. PUSH, resync OFF. The language's periodic resync is switched off
+//      (`mountResync` project interaction: every mountSnapshot after the
+//      first answers the mount as the signal worker left it, without
+//      reading). Stock creates + renames an outcome -> modelSubscribe
+//      delivers both. With nothing else feeding the mount, arrival at all
+//      proves the push path; the bound is the worker's verification budget
+//      (13 s wall clock per record) plus slack. Prints `push latency`.
+//   2. RECOVERY, resync ON. A signal hint never removes (B7 P1: no stock
+//      read proves a deletion), so stock delete_outcome_fully reaches the
+//      mount only through the periodic resync: modelQuery loses outcome,
+//      connection and comment within one resync interval + one read, no
+//      syncMount. The child outcome survives. Prints the recovery latency.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
@@ -20,7 +26,8 @@ import { rigEnv, REPO_DIR } from "../envfile.mjs";
 import * as stock from "../stock.mjs";
 
 const env = rigEnv();
-const BASE_BUNDLE = join(REPO_DIR, "language", "build", "bundle.js");
+const BASE_BUNDLE =
+  process.env.ACORN_BUNDLE ?? join(REPO_DIR, "language", "build", "bundle.js");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const NONCE = Date.now().toString(36);
 
@@ -143,7 +150,35 @@ test("setup: mount the language on a fresh perspective", async (t) => {
   t.diagnostic(`mounted ${L} on ${uuid}`);
 });
 
-test("stock outcome create+rename pushes a modelSubscribe update before the resync", async (t) => {
+// Push precondition: Acorn's get_peers (projects/src/lib.rs:190) lists
+// the signal recipients from the sender's LOCAL member links, so the stock
+// agent signals the AD4M agent only once the AD4M member entry has gossiped
+// to the stock side. A signal sent before that is never delivered (the
+// "first-signal warmup" of REPORT-b4, deviation 5) — with the resync off
+// the record would never land. Wait for the precondition, then measure.
+test("warmup: the stock side lists the AD4M agent as a peer", async (t) => {
+  const info = await ad4m.interact(`${L}://project`, "info", {});
+  const t0 = Date.now();
+  let seen = false;
+  while (!seen && Date.now() - t0 < 300000) {
+    const rows = await stock.stockCall(S, "projects", "fetch_members", {
+      input: null,
+      local: true,
+    });
+    seen = (rows ?? []).some((m) => (m?.entry ?? m)?.agentPubKey === info.agentPubKey);
+    if (!seen) await sleep(1000);
+  }
+  assert.ok(seen, `stock never listed the AD4M member ${info.agentPubKey} within 300 s`);
+  t.diagnostic(`AD4M member visible to stock after ${Date.now() - t0} ms`);
+});
+
+async function setResync(enabled) {
+  const res = await ad4m.interact(`${L}://project`, "mountResync", { enabled });
+  assert.deepEqual(res, { enabled }, `mountResync(${enabled}) answered ${JSON.stringify(res)}`);
+}
+
+test("resync OFF: stock outcome create+rename reach modelSubscribe by push alone", async (t) => {
+  await setResync(false);
   const subscriptionId = `b4-${NONCE}`;
   const sub = await ad4m.rpc("perspective.modelSubscribe", {
     uuid,
@@ -153,13 +188,13 @@ test("stock outcome create+rename pushes a modelSubscribe update before the resy
   });
   t.diagnostic(`subscription opened at revision ${sub?.revision}`);
 
-  // create lands through the same push path — fixture plus its own proof.
+  // create lands through the push path — fixture plus its own proof.
   // (url(R) matches once R is set: accept runs per frame, not per call.)
   const created = waitForUpdate(
     subscriptionId,
     (row) => rowId(row) === url(R),
-    30000,
-    "create pushes the new outcome"
+    20000,
+    "create pushes the new outcome (resync off)"
   );
   const rec = await stock.createOutcome(S, `b4 rename ${NONCE}`);
   R = rec.actionHash;
@@ -171,24 +206,21 @@ test("stock outcome create+rename pushes a modelSubscribe update before the resy
   const renamed = waitForUpdate(
     subscriptionId,
     (row) => rowId(row) === url(R) && rowField(row, "content") === NEWNAME,
-    20000,
-    "rename pushes the updated outcome"
+    30000,
+    "rename pushes the updated outcome (resync off)"
   );
   const t0 = Date.now();
   await stock.updateOutcome(S, R, { ...R_ENTRY, content: NEWNAME });
   await renamed;
   const latency = Date.now() - t0;
   console.log(`push latency: ${latency} ms`);
-  // B6: a signal is only an invalidation hint — the push waits for the
-  // update op to gossip in and verify through the zomes, so the bound is
-  // "before the ~15 s resync", not the old payload-trusted ~1 s.
-  assert.ok(
-    latency < 14000,
-    `push took ${latency}ms — did not beat the ~15 s resync`
-  );
+  // resync is off: arrival itself proves the push. The bound is the
+  // worker's per-record verification budget (13 s) + a pass + slack.
+  assert.ok(latency < 16000, `push took ${latency}ms — over the 13 s verify budget`);
 });
 
-test("stock delete_outcome_fully removes outcome, connection and comment", async (t) => {
+test("resync ON: stock delete_outcome_fully is recovered by the periodic resync", async (t) => {
+  await setResync(true);
   // fixture records — each create lands in the mount through its own signal
   const d = await stock.createOutcome(S, `b4 delete ${NONCE}`);
   D = d.actionHash;
@@ -227,9 +259,11 @@ test("stock delete_outcome_fully removes outcome, connection and comment", async
   });
   t.diagnostic(`delete_outcome_fully -> ${JSON.stringify(res).slice(0, 400)}`);
 
+  // one 15 s resync interval + one snapshot read + slack
+  const RECOVERY_MS = 30000;
   const t0 = Date.now();
   let last = null;
-  while (Date.now() - t0 < 20000) {
+  while (Date.now() - t0 < RECOVERY_MS) {
     const [outcomes, conns, comments] = await Promise.all([
       modelQuery("AcornOutcome"),
       modelQuery("AcornConnection"),
@@ -241,12 +275,15 @@ test("stock delete_outcome_fully removes outcome, connection and comment", async
       !conns.some((c) => c.id === url(D_CONN)) &&
       !comments.some((c) => c.id === url(D_COMMENT));
     if (gone) {
-      t.diagnostic(`mount lost D/conn/comment ${Date.now() - t0}ms after delete`);
+      console.log(`recovery latency: ${Date.now() - t0} ms`);
       break;
     }
     await sleep(1000);
   }
-  assert.ok(!last.outcomes.some((o) => o.id === url(D)), "D still in AcornOutcome query");
+  assert.ok(
+    !last.outcomes.some((o) => o.id === url(D)),
+    `D still in AcornOutcome query after ${RECOVERY_MS} ms`
+  );
   assert.ok(
     !last.conns.some((c) => c.id === url(D_CONN)),
     "connection still in AcornConnection query"
