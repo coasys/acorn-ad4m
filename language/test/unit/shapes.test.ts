@@ -8,7 +8,8 @@ const RESERVED = ["id", "baseExpression", "createdAt", "updatedAt", "author", "t
 const { version, shapes } = mountShapesFor(STUB_LANG);
 
 test("mountShapes returns the nine Acorn classes", () => {
-  assert.equal(version, "1");
+  // v2 adds AcornMember.sameAs (B5)
+  assert.equal(version, "2");
   assert.equal(shapes.length, 9);
   assert.deepEqual(
     shapes.map((s) => s.name),
@@ -86,7 +87,7 @@ test("destructors exist except on AcornMember, AcornProjectMeta, AcornProfile", 
 test("read-only properties carry no setter; writable ones do", () => {
   const READ_ONLY = new Set([
     "type", "entryHash", "recordCreatedAt", "recordUpdatedAt",
-    "creator", "editor", "agent", "agentPubKey",
+    "creator", "editor", "agent", "agentPubKey", "sameAs",
     "timestampCreated", "timestampUpdated", "unixTimestamp", "createdAtTime",
     "isImported", "isMigrated",
   ]);

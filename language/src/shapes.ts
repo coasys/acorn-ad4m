@@ -8,7 +8,9 @@
 // Read-only properties carry no setter; writable ones get the call setter B3
 // implements (`update` on `this`).
 
-export const SHAPES_VERSION = "1";
+// v2 adds AcornMember.sameAs (B5); the executor re-installs shapes and
+// re-syncs on a version change.
+export const SHAPES_VERSION = "2";
 
 export const CLASS_NAMES = [
   "AcornOutcome",
@@ -158,7 +160,12 @@ const CLASSES: Record<ClassName, ClassDef> = {
   AcornMember: {
     create: false,
     delete: false,
-    props: [{ name: "agent", kind: "ref", ro: true }, ...WIRE_PROPS],
+    props: [
+      { name: "agent", kind: "ref", ro: true },
+      // the own member's "same person" claim -> the AD4M DID (Correction 15)
+      { name: "sameAs", kind: "ref", ro: true },
+      ...WIRE_PROPS,
+    ],
   },
   AcornProfile: {
     create: true,

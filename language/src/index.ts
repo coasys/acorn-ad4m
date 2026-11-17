@@ -96,8 +96,14 @@ export async function mountShapes(): Promise<object> {
   return mountShapesFor(languageAddress());
 }
 
+// Identity the snapshot needs for the own member's sameAs (Correction 15):
+// the language cell's key and the executor's AD4M DID.
+function snapshotIdentity() {
+  return { ownAgent: ownAgentKey(), ad4mDid: agentDid() };
+}
+
 export async function mountSnapshot(): Promise<object> {
-  return takeSnapshot(languageAddress());
+  return takeSnapshot(languageAddress(), snapshotIdentity());
 }
 
 export async function expressionGet(address: string): Promise<object | null> {
@@ -195,6 +201,7 @@ function writeCtx(): WriteCtx {
   return {
     lang: languageAddress(),
     ownAgent: ownAgentKey(),
+    ad4mDid: agentDid(),
     seed,
   };
 }
@@ -285,7 +292,7 @@ export async function interactions(address: string): Promise<Interaction[]> {
   let hit = lastSnapshot.get(address);
   if (!hit) {
     try {
-      await takeSnapshot(languageAddress());
+      await takeSnapshot(languageAddress(), snapshotIdentity());
     } catch {
       // a failed refresh still answers from the last snapshot
     }

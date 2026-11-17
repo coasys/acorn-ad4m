@@ -26,6 +26,8 @@ export interface WriteCtx {
   lang: string;
   /** the language cell's own AgentPubKeyB64 */
   ownAgent: string;
+  /** the executor's AD4M DID — the own member's sameAs (Correction 15) */
+  ad4mDid: string;
   /** the project network seed (template banner) */
   seed: string;
 }
@@ -41,6 +43,8 @@ function mapCtx(ctx: WriteCtx): MapCtx & ToEntryCtx {
     lang: ctx.lang,
     hashToUrl: (h) => `${ctx.lang}://${h}`,
     agentToDid,
+    ownAgent: ctx.ownAgent,
+    ad4mDid: ctx.ad4mDid,
     didToAgent,
     seed: ctx.seed,
   };
@@ -346,7 +350,10 @@ export async function createRecord(
     throw new Error(m.startsWith("create:") ? m : `create: ${m}`);
   }
 
-  const snap = await takeSnapshot(ctx.lang);
+  const snap = await takeSnapshot(ctx.lang, {
+    ownAgent: ctx.ownAgent,
+    ad4mDid: ctx.ad4mDid,
+  });
   return { address, changed: pickEntries(snap, touched), removed: [] };
 }
 
@@ -430,7 +437,10 @@ export async function updateRecord(
     throw new Error(`update: ${msg(e)}`);
   }
 
-  const snap = await takeSnapshot(ctx.lang);
+  const snap = await takeSnapshot(ctx.lang, {
+    ownAgent: ctx.ownAgent,
+    ad4mDid: ctx.ad4mDid,
+  });
   return { address, changed: pickEntries(snap, [address]), removed: [] };
 }
 
@@ -489,7 +499,10 @@ export async function deleteRecord(
     throw new Error(`delete: ${msg(e)}`);
   }
 
-  const snap = await takeSnapshot(ctx.lang);
+  const snap = await takeSnapshot(ctx.lang, {
+    ownAgent: ctx.ownAgent,
+    ad4mDid: ctx.ad4mDid,
+  });
   return {
     address,
     changed: pickEntries(

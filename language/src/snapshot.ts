@@ -30,7 +30,17 @@ function isNoProjectMeta(e: unknown): boolean {
     .includes("no project meta");
 }
 
-export async function takeSnapshot(lang: string): Promise<{ entries: SnapshotEntry[] }> {
+/** Identity the snapshot needs beyond `lang`: the own agent key (whose
+ *  member gets `sameAs`) and the AD4M DID it points to (Correction 15). */
+export interface SnapshotIdentity {
+  ownAgent?: string;
+  ad4mDid?: string;
+}
+
+export async function takeSnapshot(
+  lang: string,
+  own: SnapshotIdentity = {}
+): Promise<{ entries: SnapshotEntry[] }> {
   const [
     outcomes,
     connections,
@@ -65,6 +75,8 @@ export async function takeSnapshot(lang: string): Promise<{ entries: SnapshotEnt
     lang,
     hashToUrl: (h) => `${lang}://${h}`,
     agentToDid,
+    ownAgent: own.ownAgent,
+    ad4mDid: own.ad4mDid,
     derived: deriveRelations(connections),
   };
 

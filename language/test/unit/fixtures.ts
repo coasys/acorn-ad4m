@@ -18,6 +18,7 @@ export const ENTRY_POINT_1 = "uhCkkZXAxLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi5sb2Mh"
 export const OUTCOME_MEMBER_1 = "uhCkkb20xLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi5sb2Mh";
 export const PROJECT_META = "uhCkkbWV0YTEuLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi5sb2Mh";
 export const MEMBER_1 = "uhCkkbWVtYmVyMS4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi5sb2Mh";
+export const MEMBER_2 = "uhCkkbWVtYmVyMi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi5sb2Mh";
 export const ENTRY_HASH = "uhCkkZW50cnkLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi5sb2Mh";
 
 export function wireRecord(entry: unknown, extra: Partial<Record<string, unknown>> = {}) {

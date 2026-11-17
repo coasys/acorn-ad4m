@@ -20,6 +20,10 @@ export interface MapCtx {
   lang: string;
   hashToUrl: (hash: string) => string;
   agentToDid: (b64: string) => string;
+  /** the language cell's own AgentPubKeyB64 — the own member gets `sameAs` */
+  ownAgent?: string;
+  /** the executor's AD4M DID (agentDid()); the sameAs link target */
+  ad4mDid?: string;
   derived?: Derived;
 }
 
@@ -168,6 +172,13 @@ export function toData(
     }
     case "AcornMember": {
       put(data, "agent", entry.agentPubKey && ctx.agentToDid(entry.agentPubKey));
+      // The mount only writes links from <lang>://… sources, so the "this
+      // Acorn key and this AD4M DID are the same person" claim is a
+      // property of the OWN member record (Correction 15). Removing this
+      // own-key check turns members.test.ts red.
+      if (entry.agentPubKey === ctx.ownAgent) {
+        put(data, "sameAs", ctx.ad4mDid);
+      }
       break;
     }
     case "AcornProfile": {
