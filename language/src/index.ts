@@ -37,6 +37,7 @@ declare const seed: string;
 // Build-time constants injected by build.mjs (esbuild `define`).
 declare const ACORN_HAPP_B64: string;
 declare const ACORN_DEBUG_CALL: boolean;
+declare const ACORN_MOUNT_RESYNC: boolean;
 
 export const name = "acorn";
 export const version = "0.0.1";
@@ -132,7 +133,20 @@ function snapshotIdentity() {
   return { ownAgent: ownAgentKey(), ad4mDid: agentDid() };
 }
 
+// The periodic full resync (Lal round 2, #5). The executor calls
+// mountSnapshot every 15 s (a constant in the binary); with this off,
+// every call after the first answers the mount as the signal worker left
+// it, without reading the zomes — the executor's diff is then a no-op, so
+// nothing reaches the mount except pushed deltas and write answers.
+// Default from the build (ACORN_MOUNT_RESYNC=off node build.mjs), switched
+// at runtime by the `mountResync` project interaction. Note the resync is
+// also the only path that REMOVES records (signals.ts): with it off,
+// stock-side deletions do not reach the mount. The worker's own overflow
+// fallback still runs a full resync.
+let periodicResync = ACORN_MOUNT_RESYNC;
+
 export async function mountSnapshot(): Promise<object> {
+  if (hasMounted && !periodicResync) return { entries: mountState.list() };
   const { entries, seq } = await resyncSnapshot(
     languageAddress(),
     snapshotIdentity()
@@ -148,7 +162,7 @@ export async function mountSnapshot(): Promise<object> {
 
 export async function expressionGet(address: string): Promise<object | null> {
   // `address` is the URL path — the create action hash, or `profile/<key>`.
-  if (!lastSnapshot.has(address)) {
+  if (!lastSnapshot.has(address) && periodicResync) {
     try {
       await mountSnapshot();
     } catch {
@@ -282,6 +296,15 @@ export async function interactions(address: string): Promise<Interaction[]> {
             p ?? null
           );
           return null;
+        },
+      },
+      {
+        name: "mountResync",
+        label: "Switch the periodic full resync on or off; answers the setting",
+        parameters: [{ name: "enabled", type: "boolean" }],
+        execute: async (p: any) => {
+          if (typeof p?.enabled === "boolean") periodicResync = p.enabled;
+          return { enabled: periodicResync };
         },
       },
       {

@@ -3,6 +3,7 @@
 //
 //   ACORN_DEBUG_CALL=1 node build.mjs   — adds the generic `call` interaction
 //   node build.mjs                      — only `info`
+//   ACORN_MOUNT_RESYNC=off node build.mjs — periodic resync starts off
 //
 // The banner's two lines are what `language.applyTemplateLocal` rewrites:
 // the file MUST start with them, and must never contain `var happ = `
@@ -18,6 +19,14 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const happ = readFileSync(join(HERE, "vendor", "acorn.happ"));
 const sha256 = createHash("sha256").update(happ).digest("hex");
 const debugCall = !!process.env.ACORN_DEBUG_CALL;
+// ACORN_MOUNT_RESYNC=off: the periodic full resync starts switched off
+// (src/index.ts `periodicResync`; the `mountResync` interaction flips it).
+const resyncEnv = (process.env.ACORN_MOUNT_RESYNC ?? "on").toLowerCase();
+if (!["on", "off", "1", "0", "true", "false"].includes(resyncEnv)) {
+  console.error(`build: ACORN_MOUNT_RESYNC must be on|off, got ${resyncEnv}`);
+  process.exit(1);
+}
+const mountResync = ["on", "1", "true"].includes(resyncEnv);
 
 const BANNER = '//!@ad4m-template-variable\nconst seed = "";';
 
@@ -36,6 +45,7 @@ await build({
   define: {
     ACORN_HAPP_B64: JSON.stringify(happ.toString("base64")),
     ACORN_DEBUG_CALL: debugCall ? "true" : "false",
+    ACORN_MOUNT_RESYNC: mountResync ? "true" : "false",
   },
 });
 
@@ -55,5 +65,5 @@ if (out.includes("var happ = ")) {
 }
 
 console.log(
-  `build: bundle.js written (happ sha256 ${sha256.slice(0, 16)}…, ${happ.length} bytes, debug call ${debugCall ? "on" : "off"})`
+  `build: bundle.js written (happ sha256 ${sha256.slice(0, 16)}…, ${happ.length} bytes, debug call ${debugCall ? "on" : "off"}, mount resync ${mountResync ? "on" : "off"})`
 );

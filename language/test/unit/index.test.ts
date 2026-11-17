@@ -47,7 +47,12 @@ async function loadLanguage(defines: Record<string, string> = {}): Promise<any> 
     mainFields: ["module", "main"],
     outfile: out,
     banner: { js: 'const seed = "test-seed";' },
-    define: { ACORN_HAPP_B64: '""', ACORN_DEBUG_CALL: "false", ...defines },
+    define: {
+      ACORN_HAPP_B64: '""',
+      ACORN_DEBUG_CALL: "false",
+      ACORN_MOUNT_RESYNC: "true",
+      ...defines,
+    },
     plugins: [
       {
         name: "host-stub",
@@ -136,4 +141,57 @@ test("a hint landing during the first snapshot's reads is reconciled after init"
     3000,
     "B pushed after init"
   );
+});
+
+// ---- periodic resync switch (Lal round 2, P2 #5) ---------------------------
+//
+// The executor re-runs mountSnapshot every 15 s (its interval is fixed in
+// the binary). With the language's periodic resync OFF, every mountSnapshot
+// after the first answers the mount as signals left it, without reading —
+// so a rig can prove the push path with no resync behind it.
+
+function countingHost(host: Host) {
+  installHost(host);
+  const h = (globalThis as any).__acornHost;
+  const calls = { local: 0 };
+  const inner = h.holochainCall;
+  h.holochainCall = (n: string, z: string, fn: string, p: any) => {
+    if (p?.local !== false) calls.local++;
+    return inner(n, z, fn, p);
+  };
+  return calls;
+}
+
+test("mountResync off: later mountSnapshots answer the mount without reading", async () => {
+  const host: Host = { local: { outcomes: [outcomeA()] }, network: {}, emitted: [] };
+  const calls = countingHost(host);
+  const lang = await loadLanguage();
+  await lang.mountSnapshot();
+  const project = await lang.interactions("project");
+  const sw = project.find((i: any) => i.name === "mountResync");
+  assert.ok(sw, "no mountResync interaction on project");
+  assert.deepEqual(await sw.execute({ enabled: false }), { enabled: false });
+  const before = calls.local;
+  host.local.outcomes = [outcomeB()]; // the zomes changed; no signal
+  const { entries } = await lang.mountSnapshot();
+  assert.equal(calls.local, before, "resync off still read the zomes");
+  assert.deepEqual(entries.map((e: any) => e.address), [OUTCOME_A]);
+  // on again: the next mountSnapshot reads and converges
+  assert.deepEqual(await sw.execute({ enabled: true }), { enabled: true });
+  const again = await lang.mountSnapshot();
+  assert.deepEqual(again.entries.map((e: any) => e.address), [OUTCOME_B]);
+});
+
+test("ACORN_MOUNT_RESYNC=off at build time starts with the resync off", async () => {
+  const host: Host = { local: { outcomes: [outcomeA()] }, network: {}, emitted: [] };
+  const calls = countingHost(host);
+  const lang = await loadLanguage({ ACORN_MOUNT_RESYNC: "false" });
+  await lang.mountSnapshot(); // the first snapshot always reads
+  const after = calls.local;
+  assert.ok(after > 0);
+  host.local.outcomes = [];
+  await lang.mountSnapshot();
+  assert.equal(calls.local, after);
+  const sw = (await lang.interactions("project")).find((i: any) => i.name === "mountResync");
+  assert.deepEqual(await sw?.execute({}), { enabled: false });
 });
