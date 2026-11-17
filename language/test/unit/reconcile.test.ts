@@ -438,6 +438,8 @@ test("a failing overflow resync is retried with backoff, never two at once (roun
   let resyncs = 0;
   let running = 0;
   let maxRunning = 0;
+  const starts: number[] = [];
+  const ends: number[] = [];
   const r = new Reconciler({
     lang: LANG,
     state: new MountState(),
@@ -445,10 +447,12 @@ test("a failing overflow resync is retried with backoff, never two at once (roun
     emit: () => {},
     resync: async () => {
       resyncs++;
+      starts.push(Date.now());
       running++;
       maxRunning = Math.max(maxRunning, running);
       await sleep(5);
       running--;
+      ends.push(Date.now());
       throw new Error("tags: source chain error");
     },
     maxPending: 2,
@@ -461,4 +465,12 @@ test("a failing overflow resync is retried with backoff, never two at once (roun
   await sleep(300);
   assert.ok(resyncs >= 3, `owed resync retried only ${resyncs}x`);
   assert.equal(maxRunning, 1, "resyncs stacked");
+  // backoff 10, 20, 40, 80 ... ms between a failure and the next attempt
+  // (2 ms slack for timer/clock granularity): at most 5 attempts in 300 ms
+  for (let i = 1; i < starts.length; i++) {
+    const gap = starts[i] - ends[i - 1];
+    const want = 10 * 2 ** (i - 1);
+    assert.ok(gap >= want - 2, `retry ${i} after ${gap} ms (backoff ${want} ms)`);
+  }
+  assert.ok(resyncs <= 5, `${resyncs} attempts in 300 ms — no backoff`);
 });
