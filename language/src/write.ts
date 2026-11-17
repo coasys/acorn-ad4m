@@ -15,11 +15,10 @@ import {
   type MapCtx,
   type ToEntryCtx,
 } from "./mapping";
-import { takeSnapshot, type SnapshotEntry } from "./snapshot";
+import { lastSnapshot, takeSnapshot, type SnapshotEntry } from "./snapshot";
 import { isClassName, writablePropNames } from "./shapes";
 
 const NICK = "projects";
-const PROFILES_ZOME = "profiles";
 
 /** What an interaction needs besides the caller's params. */
 export interface WriteCtx {
@@ -413,6 +412,72 @@ export async function updateRecord(
 
   const snap = await takeSnapshot(ctx.lang);
   return { address, changed: pickEntries(snap, [address]), removed: [] };
+}
+
+// ---------------------------------------------------------------------------
+// delete
+// ---------------------------------------------------------------------------
+
+export async function deleteRecord(
+  className: string,
+  address: string,
+  ctx: WriteCtx
+): Promise<MountDelta> {
+  const fns = FNS[className];
+  if (!fns?.del) throw new Error(`delete: ${className} has no delete`);
+
+  // Records whose mounted data changes when this one disappears: an
+  // outcome's former parent (children loses it) and children (parent
+  // clears); a connection's two ends. `removed` only strips the deleted
+  // record's own links, so the delta must re-expand these.
+  const pre = lastSnapshot.get(address)?.data ?? {};
+  const touched: string[] = [];
+  const parent = pre.parent != null ? urlToHash(pre.parent, ctx.lang) : null;
+  const child = pre.child != null ? urlToHash(pre.child, ctx.lang) : null;
+  if (className === "AcornOutcome") {
+    if (parent) touched.push(parent);
+    for (const c of Array.isArray(pre.children) ? pre.children : []) {
+      touched.push(urlToHash(c, ctx.lang));
+    }
+  } else if (className === "AcornConnection") {
+    if (parent) touched.push(parent);
+    if (child) touched.push(child);
+  }
+
+  let removed: string[];
+  try {
+    if (className === "AcornOutcome") {
+      // delete_outcome_fully also removes the connections, members,
+      // comments and entry points attached to the outcome — the mount's
+      // `removed` must list every one (votes are not mounted).
+      const res = await holochainCall(NICK, fns.zome, fns.del, {
+        input: address,
+        local: true,
+      });
+      removed = [
+        address,
+        ...(res.deletedConnections ?? []),
+        ...(res.deletedOutcomeMembers ?? []),
+        ...(res.deletedOutcomeComments ?? []),
+        ...(res.deletedEntryPoints ?? []),
+      ];
+    } else {
+      await holochainCall(NICK, fns.zome, fns.del, address);
+      removed = [address];
+    }
+  } catch (e) {
+    throw new Error(`delete: ${msg(e)}`);
+  }
+
+  const snap = await takeSnapshot(ctx.lang);
+  return {
+    address,
+    changed: pickEntries(
+      snap,
+      touched.filter((a) => !removed.includes(a))
+    ),
+    removed,
+  };
 }
 
 // ---------------------------------------------------------------------------

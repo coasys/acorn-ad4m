@@ -15,6 +15,7 @@ import { lastSnapshot, takeSnapshot } from "./snapshot";
 import {
   createParameters,
   createRecord,
+  deleteRecord,
   updateParameters,
   updateRecord,
   writeCaps,
@@ -201,6 +202,14 @@ export async function interactions(address: string): Promise<Interaction[]> {
       parameters: updateParameters(hit.class),
       execute: (params: any) =>
         updateRecord(hit.class, address, params ?? {}, ctx),
+    });
+  }
+  if (caps.delete) {
+    list.push({
+      name: "delete",
+      label: `Delete ${hit.class.slice("Acorn".length)}`,
+      parameters: [],
+      execute: () => deleteRecord(hit.class, address, ctx),
     });
   }
   return list;
