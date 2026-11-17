@@ -303,34 +303,64 @@ test("B6: repeated identical create returns the canonical mounted URL", async (t
 });
 
 test("B6: updateSubject on a connection returns old+new endpoints in the mount", async () => {
-  // Reparent the P->C connection's child to a fresh outcome D. The
-  // synchronous delta must re-expand the outcomes at BOTH ends of the
-  // move: C loses its `parent` link, D gains it — checked straight from
-  // modelQuery with no syncMount, same as the delete test below.
+  // Own fixture (Lal round 2, P3): Q->E is moved to Q->F, leaving P->C —
+  // the delete test's fixture — untouched. The synchronous delta must
+  // re-expand the outcomes at BOTH ends of the move: E loses its `parent`
+  // link, F gains it — checked straight from modelQuery, no syncMount.
+  const qUrl = await createSubject("AcornOutcome", { content: "Q" });
+  const Q = qUrl.slice(`${L}://`.length);
+  const eUrl = await createSubject("AcornOutcome", { content: "E", parent: qUrl });
+  const E = eUrl.slice(`${L}://`.length);
+  const fUrl = await createSubject("AcornOutcome", { content: "F" });
+  const F = fUrl.slice(`${L}://`.length);
   const conn = await until(
     connections,
-    (rows) => rows.find((r) => r.entry.parentActionHash === P && r.entry.childActionHash === C),
+    (rows) => rows.find((r) => r.entry.parentActionHash === Q && r.entry.childActionHash === E),
     30000,
-    "stock fetch_connections has P->C"
+    "stock fetch_connections has Q->E"
   );
-  const dUrl = await createSubject("AcornOutcome", { content: "D" });
-  const D = dUrl.slice(`${L}://`.length);
-  await updateSubject("AcornConnection", conn.actionHash, { child: url(D) });
+  const pre = await modelQuery("AcornOutcome");
+  assert.equal(pre.find((o) => o.id === eUrl)?.parent, qUrl, "precondition: E.parent is Q");
+
+  await updateSubject("AcornConnection", conn.actionHash, { child: fUrl });
   await until(
     connections,
-    (rows) => rows.find((r) => r.entry.parentActionHash === P && r.entry.childActionHash === D),
+    (rows) => rows.find((r) => r.entry.parentActionHash === Q && r.entry.childActionHash === F),
     30000,
-    "stock connection now points P->D"
+    "stock connection now points Q->F"
   );
   const outcomeRows = await modelQuery("AcornOutcome");
-  const d = outcomeRows.find((o) => o.id === dUrl);
-  const c = outcomeRows.find((o) => o.id === url(C));
-  assert.equal(d?.parent, url(P), "D.parent is not P after the move");
-  assert.ok(c, "C vanished from the mount");
-  assert.ok(c.parent == null, `C.parent still set: ${JSON.stringify(c.parent)}`);
+  const f = outcomeRows.find((o) => o.id === fUrl);
+  const e = outcomeRows.find((o) => o.id === eUrl);
+  assert.equal(f?.parent, qUrl, "F.parent is not Q after the move");
+  assert.ok(e, "E vanished from the mount");
+  assert.ok(e.parent == null, `E.parent still set: ${JSON.stringify(e.parent)}`);
 });
 
 test("removeSubject AcornOutcome C deletes C, P->C and the comment everywhere", async () => {
+  // Preconditions (Lal round 2, P3): every absence asserted below must be
+  // present right before the delete, or the assertion proves nothing.
+  const pc = (await connections()).find(
+    (r) => r.entry.parentActionHash === P && r.entry.childActionHash === C
+  );
+  assert.ok(pc, "precondition: stock has P->C before the delete");
+  assert.ok(await findRecord(comments, COMMENT), "precondition: stock has the comment");
+  const preOutcomes = await modelQuery("AcornOutcome");
+  assert.ok(preOutcomes.some((o) => o.id === url(C)), "precondition: C mounted");
+  const preP = preOutcomes.find((o) => o.id === url(P));
+  assert.ok(
+    Array.isArray(preP?.children) && preP.children.includes(url(C)),
+    `precondition: P.children lists C: ${JSON.stringify(preP?.children)}`
+  );
+  assert.ok(
+    (await modelQuery("AcornConnection")).some((c) => c.id === url(pc.actionHash)),
+    "precondition: P->C mounted"
+  );
+  assert.ok(
+    (await modelQuery("AcornOutcomeComment")).some((c) => c.id === url(COMMENT)),
+    "precondition: comment mounted"
+  );
+
   await removeSubject("AcornOutcome", C);
 
   // stock side: outcome, connection and comment all gone
