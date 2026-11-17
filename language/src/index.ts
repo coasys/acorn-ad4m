@@ -58,6 +58,39 @@ export function isPublic(): boolean {
   return false;
 }
 
+// B4 capture: log the raw shape of one Holochain signal so the decoder can be
+// written against fact, not assumption (design R11). Uint8Array previews as
+// {__u8: len, head: [..]} so JSON.stringify stays readable.
+export async function handleHolochainSignal(signal: any): Promise<void> {
+  try {
+    const p = signal?.payload;
+    const preview = JSON.stringify(signal, (_k, v) =>
+      v instanceof Uint8Array
+        ? { __u8: v.length, head: Array.from(v.slice(0, 60)) }
+        : v
+    )?.slice(0, 3000);
+    console.warn(
+      "ACORN_RAW_SIGNAL " +
+        JSON.stringify({
+          keys: signal == null ? signal : Object.keys(signal),
+          payloadType:
+            p instanceof Uint8Array
+              ? `Uint8Array(${p.byteLength})`
+              : p === null
+                ? "null"
+                : Array.isArray(p)
+                  ? "array"
+                  : typeof p,
+          payloadHead:
+            p instanceof Uint8Array ? Array.from(p.slice(0, 200)) : undefined,
+          preview,
+        })
+    );
+  } catch (e) {
+    console.warn("ACORN_RAW_SIGNAL error", String(e));
+  }
+}
+
 // --- Mount contract (B2 read side; see spec/09-b2-read-side.md) ---
 
 export async function mountShapes(): Promise<object> {
