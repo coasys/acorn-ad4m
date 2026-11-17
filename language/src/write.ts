@@ -59,7 +59,27 @@ function pickEntries(
   addrs: string[]
 ): SnapshotEntry[] {
   const byAddr = new Map(snap.entries.map((e) => [e.address, e]));
-  return addrs.map((a) => byAddr.get(a)).filter((e): e is SnapshotEntry => e != null);
+  return [...new Set(addrs)]
+    .map((a) => byAddr.get(a))
+    .filter((e): e is SnapshotEntry => e != null);
+}
+
+// The mount's canonical address for a created record (B6, Lal P2):
+// hdk_crud's do_create always commits a NEW action and returns its hash,
+// but fetch_* lists one record per ENTRY under the ORIGINAL create action
+// (get_latest_for_entry → details.actions.first()) — an identical
+// re-create answers an actionHash the mount never lists. Reconcile against
+// the fresh snapshot by entryHash (the mounted identity); the returned
+// hash stays only as the fallback while the record is not mounted yet.
+function mountedAddr(
+  snap: { entries: SnapshotEntry[] },
+  created: { actionHash: string; entryHash?: unknown }
+): string {
+  const hit =
+    typeof created.entryHash === "string"
+      ? snap.entries.find((e) => e.data?.entryHash === created.entryHash)
+      : null;
+  return hit?.address ?? created.actionHash;
 }
 
 function msg(e: unknown): string {
@@ -286,7 +306,10 @@ export async function createRecord(
   const p = createParams(className, params ?? {});
   const mctx = mapCtx(ctx);
   const touched: string[] = [];
-  let address: string;
+  // Every created WireRecord as {actionHash, entryHash}; reconciled to the
+  // canonical mount addresses once the fresh snapshot is in (mountedAddr).
+  const created: { actionHash: string; entryHash?: unknown }[] = [];
+  let profileAddress: string | null = null;
 
   try {
     if (className === "AcornOutcome") {
@@ -305,10 +328,9 @@ export async function createRecord(
         entry,
         maybeLinkedOutcome,
       });
-      address = res.outcome.actionHash;
-      touched.push(address);
+      created.push(res.outcome);
       if (res.maybeConnection?.actionHash) {
-        touched.push(res.maybeConnection.actionHash);
+        created.push(res.maybeConnection);
         touched.push(urlToHash(p.parent, ctx.lang));
       }
     } else if (className === "AcornProjectMeta") {
@@ -317,8 +339,7 @@ export async function createRecord(
         input: entry,
         local: true,
       });
-      address = wr.actionHash;
-      touched.push(address);
+      created.push(wr);
     } else {
       if (className === "AcornConnection" && (p.parent == null || p.child == null)) {
         throw new Error("AcornConnection needs parent and child URLs");
@@ -337,11 +358,11 @@ export async function createRecord(
       const entry = toEntry(className, createData(className, p, ctx), mctx);
       const wr = await ctx.call(fns.zome, fns.create, entry);
       if (className === "AcornProfile") {
-        address = `profile/${entry.agentPubKey}`;
+        // a profile mounts under its author key, not an action hash
+        profileAddress = `profile/${entry.agentPubKey}`;
       } else {
-        address = wr.actionHash;
+        created.push(wr);
       }
-      touched.push(address);
       if (className === "AcornConnection") {
         // both ends' parent/children views changed
         touched.push(urlToHash(p.parent, ctx.lang), urlToHash(p.child, ctx.lang));
@@ -353,7 +374,19 @@ export async function createRecord(
   }
 
   const snap = await ctx.snapshot();
-  return { address, changed: pickEntries(snap, touched), removed: [] };
+  const canonical = created.map((c) => mountedAddr(snap, c));
+  const address = profileAddress ?? canonical[0];
+  if (address == null) {
+    throw new Error("create: the zome returned no record");
+  }
+  return {
+    address,
+    changed: pickEntries(
+      snap,
+      [...(profileAddress ? [profileAddress] : canonical), ...touched]
+    ),
+    removed: [],
+  };
 }
 
 // ---------------------------------------------------------------------------
