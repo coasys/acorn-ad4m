@@ -25,6 +25,7 @@ let ws = null;
 let wsReady = null;
 let nextId = 1;
 const pending = new Map();
+const listeners = new Set();
 
 function connect() {
   if (wsReady) return wsReady;
@@ -32,9 +33,13 @@ function connect() {
   ws = new WebSocket(`ws://127.0.0.1:${port}/api/v1/ws`);
   ws.on("message", (raw) => {
     const msg = JSON.parse(raw);
-    if (pending.has(msg.id)) {
+    if (msg.id != null && pending.has(msg.id)) {
       pending.get(msg.id)(msg);
       pending.delete(msg.id);
+    } else {
+      // event frames (query-subscription-update, link-added, …) carry no
+      // pending id — fan them out to listeners
+      for (const cb of listeners) cb(msg);
     }
   });
   wsReady = new Promise((resolve, reject) => {
@@ -67,6 +72,14 @@ export function close() {
   if (ws) ws.close();
   ws = null;
   wsReady = null;
+  listeners.clear();
+}
+
+// Every frame that is not an rpc reply, live query updates included
+// (they bypass events.watch but only reach the socket that opened them).
+export function onEvent(cb) {
+  listeners.add(cb);
+  return () => listeners.delete(cb);
 }
 
 // ---- language bundle addressing ------------------------------------------
