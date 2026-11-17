@@ -32,11 +32,11 @@ function isNoProjectMeta(e: unknown): boolean {
 export async function resyncSnapshot(
   lang: string,
   own: SnapshotIdentity = {}
-): Promise<{ entries: SnapshotEntry[]; delta: MountDelta }> {
+): Promise<{ entries: SnapshotEntry[]; delta: MountDelta; seq: number }> {
   const seq = mountState.beginRead();
   const read = await readSnapshot(lang, own);
   const delta = mountState.applySnapshot(read, seq);
-  return { entries: mountState.list(), delta };
+  return { entries: mountState.list(), delta, seq };
 }
 
 export async function takeSnapshot(

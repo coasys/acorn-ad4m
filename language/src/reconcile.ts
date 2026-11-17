@@ -114,6 +114,8 @@ export class Reconciler {
   private readonly queue = new Map<string, Dirty>();
   private started = false;
   private overflowPending = false;
+  /** MountState seq at the last hint the pending resync must cover */
+  private overflowSeq = 0;
   private loop: Promise<void> | null = null;
   private readonly maxPending: number;
   private readonly budgetMs: number;
@@ -132,16 +134,29 @@ export class Reconciler {
     return this.queue.size;
   }
 
-  /** Begin acting on hints (after the first snapshot). */
-  start(): void {
+  /** Begin acting on hints, after the first snapshot — whose read began
+   *  at `readSeq`. Hints queued before stay dirty and are reconciled now
+   *  (their deadlines start here): a change made while the first
+   *  snapshot was reading is not lost until the resync. */
+  start(readSeq?: number): void {
     if (this.started) return;
     this.started = true;
+    if (readSeq !== undefined) this.coveredBy(readSeq);
     const now = Date.now();
     for (const d of this.queue.values()) {
       d.deadline = now + this.budgetMs;
       d.nextAt = now;
     }
     this.kick();
+  }
+
+  /** A full read that began at `readSeq` completed: a pending overflow
+   *  resync is redundant if that read began after every hint it was
+   *  meant to cover. */
+  coveredBy(readSeq: number): void {
+    if (this.overflowPending && readSeq > this.overflowSeq) {
+      this.overflowPending = false;
+    }
   }
 
   /** Resolves once the worker has nothing left to do. */
@@ -175,10 +190,15 @@ export class Reconciler {
         if (this.started) d.deadline = now + this.budgetMs;
         continue;
       }
-      if (this.overflowPending) continue; // the pending resync covers it
+      if (this.overflowPending) {
+        // the pending resync covers it, if its read begins after this
+        this.overflowSeq = this.o.state.beginRead();
+        continue;
+      }
       if (this.queue.size >= this.maxPending) {
         this.queue.clear();
         this.overflowPending = true;
+        this.overflowSeq = this.o.state.beginRead();
         this.stats.overflows++;
         continue;
       }

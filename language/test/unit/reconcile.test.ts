@@ -209,3 +209,44 @@ test("delete hints queue nothing and fetch nothing (P1)", async () => {
   await idleWithin(r, 500);
   assert.equal(fetches, 0);
 });
+
+// ---- before the first snapshot (Lal round 2, remaining checks) ------------
+
+function unstarted(state: MountState, maxPending: number) {
+  let resyncs = 0;
+  const r = new Reconciler({
+    lang: LANG,
+    state,
+    fetch: async () => [],
+    emit: () => {},
+    resync: async () => {
+      resyncs++;
+      return { changed: [], removed: [] };
+    },
+    budgetMs: 50,
+    retryMs: 5,
+    maxPending,
+  });
+  return { r, resyncs: () => resyncs };
+}
+
+test("overflow before init that the init read covers costs no extra resync", async () => {
+  const state = new MountState();
+  const { r, resyncs } = unstarted(state, 5);
+  for (let i = 0; i < 20; i++) r.hint(hint("create", outcome(addr(i), REV0)));
+  const initRead = state.beginRead(); // the first snapshot begins after them
+  r.start(initRead);
+  await idleWithin(r, 1000);
+  assert.equal(resyncs(), 0);
+});
+
+test("overflow with a hint dropped DURING the init read still resyncs after init", async () => {
+  const state = new MountState();
+  const { r, resyncs } = unstarted(state, 5);
+  for (let i = 0; i < 10; i++) r.hint(hint("create", outcome(addr(i), REV0)));
+  const initRead = state.beginRead();
+  r.hint(hint("create", outcome(addr(99), REV0))); // lands mid-read
+  r.start(initRead);
+  await idleWithin(r, 1000);
+  assert.equal(resyncs(), 1);
+});

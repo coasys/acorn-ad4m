@@ -75,10 +75,11 @@ export function isPublic(): boolean {
 // echo back through this path too (get_peers includes the sender) and
 // are a no-op: the guard drops a re-read identical to what is mounted.
 //
-// The worker only starts once the first snapshot has run — before any
-// mount there is nothing to invalidate, and the mount itself picks the
-// records up (a stock-side burst of hundreds of signals would otherwise
-// starve the runtime in fetch-verification).
+// The worker only starts once the first snapshot has run; hints that land
+// before are queued dirty (bounded — a pre-mount burst overflows into "the
+// first snapshot covers it") and reconciled right after it, so a change
+// made while the first snapshot was reading is not lost until the resync
+// (Lal round 2, remaining checks).
 let hasMounted = false;
 
 // Verified-collection read for the worker: a NETWORK get — a signal
@@ -111,7 +112,6 @@ function reconciler(): Reconciler {
 
 export async function handleHolochainSignal(signal: any): Promise<void> {
   try {
-    if (!hasMounted) return;
     const decoded = decodeSignalEnvelope(signal?.payload);
     if (!decoded) return;
     reconciler().hint(decoded);
@@ -133,12 +133,17 @@ function snapshotIdentity() {
 }
 
 export async function mountSnapshot(): Promise<object> {
-  const snap = await takeSnapshot(languageAddress(), snapshotIdentity());
+  const { entries, seq } = await resyncSnapshot(
+    languageAddress(),
+    snapshotIdentity()
+  );
   if (!hasMounted) {
     hasMounted = true;
-    reconciler().start();
+    reconciler().start(seq);
+  } else {
+    reconciler().coveredBy(seq);
   }
-  return snap;
+  return { entries };
 }
 
 export async function expressionGet(address: string): Promise<object | null> {
