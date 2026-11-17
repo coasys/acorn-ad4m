@@ -18,9 +18,19 @@
 // built exclusively from records fetched through the zomes (`ctx.fetch`,
 // the same read path the snapshot uses) — the DHT's signed, validated
 // copies. Signal fields never reach a delta: a claimed create/update that
-// does not fetch produces nothing; a claimed delete produces `removed`
-// only when the fetch confirms the record is gone; a profile is emitted
-// only as fetched, for the agent key the claim names.
+// does not fetch produces nothing; a profile is emitted only as fetched,
+// for the agent key the claim names.
+//
+// Deletion (Lal round 2, P1): a hint NEVER removes a mounted record. A
+// removal would need proof of a tombstone, and the stock zomes expose no
+// read that gives one: every fetch_* goes through hdk_crud's
+// get_latest_for_entry, which answers None alike for
+// EntryDhtStatus::Dead, for details not (yet) gossiped to us and — in
+// fetch_links/Specific — for a per-record error it silently drops. So
+// "absent from the list" is inconclusive, and the only path that removes
+// is the periodic full resync (mountSnapshot). Every target is also bound
+// to the class it is mounted as: a hint about class X never changes a
+// record mounted as class Y.
 //
 // `signalToDelta` is async and poll-bounded: a signal routinely lands
 // before the op it announces has gossiped in, so each confirmation polls
@@ -291,15 +301,11 @@ export async function signalToDelta(
     });
   };
 
-  // True only when the record is confirmed ABSENT after the full poll
-  // budget — `removed` never leaves on anything less.
-  const confirmGone = async (kind: FetchKind, hash: string): Promise<boolean> => {
-    const gone = await poll(async () =>
-      (await freshRows(kind)).some((r: any) => r?.actionHash === hash)
-        ? null
-        : true
-    );
-    return gone === true;
+  // Class binding: may a record of `className` be (re)mounted at `addr`?
+  // Only when nothing else is mounted there.
+  const boundTo = (addr: string, className: string): boolean => {
+    const hit = ctx.snapshot.get(addr);
+    return !hit || hit.class === className;
   };
 
   const changed: SnapshotEntry[] = [];
@@ -316,7 +322,7 @@ export async function signalToDelta(
     addr: string | null | undefined,
     derived: Derived
   ) => {
-    if (!addr || have.has(addr)) return;
+    if (!addr || have.has(addr) || !boundTo(addr, "AcornOutcome")) return;
     const rec = (await rows("outcomes")).find((r: any) => r?.actionHash === addr);
     if (rec) {
       push({
@@ -342,9 +348,11 @@ export async function signalToDelta(
 
   if (signalType === "OutcomeWithConnection") {
     const claim = inner?.outcome;
-    const addr = str(claim?.actionHash);
+    let addr = str(claim?.actionHash);
     const connClaim = inner?.maybeConnection;
-    const connHash = str(connClaim?.actionHash);
+    let connHash = str(connClaim?.actionHash);
+    if (addr && !boundTo(addr, "AcornOutcome")) addr = null;
+    if (connHash && !boundTo(connHash, "AcornConnection")) connHash = null;
     const outcomeRec = addr
       ? await confirmRecord("outcomes", addr)
       : null;
@@ -382,43 +390,8 @@ export async function signalToDelta(
   }
 
   if (signalType === "DeleteOutcomeFully") {
-    const outcome = str(inner?.outcomeActionHash);
-    if (!outcome) return null;
-    // the head record must confirm gone before anything is removed
-    if (!(await confirmGone("outcomes", outcome))) return null;
-    const snap = snapshotConns(ctx);
-    const conns = await freshRows("connections");
-    const touched = new Set<string>();
-    const removed = new Set<string>([outcome]);
-    const lists: [unknown, FetchKind][] = [
-      [inner.deletedConnections, "connections"],
-      [inner.deletedOutcomeMembers, "outcomeMembers"],
-      [inner.deletedOutcomeComments, "comments"],
-      [inner.deletedEntryPoints, "entryPoints"],
-    ];
-    for (const [list, kind] of lists) {
-      if (!Array.isArray(list)) continue;
-      const present = new Set(
-        (kind === "connections" ? conns : await freshRows(kind)).map(
-          (r: any) => r?.actionHash
-        )
-      );
-      for (const h of list) {
-        if (typeof h !== "string" || present.has(h)) continue;
-        removed.add(h);
-        if (kind === "connections") {
-          const c = snap.get(h);
-          if (c) {
-            touched.add(c.parent);
-            touched.add(c.child);
-          }
-        }
-      }
-    }
-    touched.delete(outcome);
-    const derived = deriveRelations(conns);
-    await expandTouched(touched, derived);
-    return { changed, removed: [...removed] };
+    // a deletion claim — never proof (P1); the resync removes.
+    return null;
   }
 
   if (signalType === "Member") {
@@ -433,7 +406,7 @@ export async function signalToDelta(
           (r: any) => (r?.entry ?? r)?.agentPubKey === key
         ) ?? null
     );
-    if (rec?.actionHash) {
+    if (rec?.actionHash && boundTo(rec.actionHash, "AcornMember")) {
       return {
         changed: [
           {
@@ -445,16 +418,7 @@ export async function signalToDelta(
         removed: [],
       };
     }
-    // A delete claim removes the mounted record only when its address is
-    // known — the snapshot's; an unconfirmed create/update produces nothing.
-    if (action === "delete") {
-      const did = agentToDid(key);
-      for (const [addr, e] of ctx.snapshot) {
-        if (e.class === "AcornMember" && e.data.agent === did) {
-          return { changed: [], removed: [addr] };
-        }
-      }
-    }
+    // an unconfirmed claim — create, update or delete — changes nothing
     return null;
   }
 
@@ -464,7 +428,7 @@ export async function signalToDelta(
     if (action === "create" || action === "update") {
       const claim = inner?.entry ?? inner;
       const key = str(claim?.agentPubKey);
-      if (!key) return null;
+      if (!key || !boundTo(`profile/${key}`, "AcornProfile")) return null;
       const rec = await poll(
         async () =>
           (await freshRows("profiles")).find(
@@ -495,24 +459,12 @@ export async function signalToDelta(
   const kind = KIND_FOR[className];
   if (!kind) return null;
 
-  if (action === "delete") {
-    const hash = str(inner) ?? str(inner?.actionHash);
-    if (!hash) return null;
-    if (!(await confirmGone(kind, hash))) return null;
-    if (className === "AcornConnection") {
-      // the record is gone; its ends come from the snapshot (verified on
-      // an earlier fetch) and are re-expanded against the fresh conn set
-      const old = snapshotConns(ctx).get(hash);
-      const derived = deriveRelations(await rows("connections"));
-      await expandTouched([old?.parent, old?.child], derived);
-      return { changed, removed: [hash] };
-    }
-    return { changed: [], removed: [hash] };
-  }
+  // a deletion claim — never proof (P1); the resync removes.
+  if (action === "delete") return null;
 
   if (action === "create" || action === "update") {
     const addr = str(inner?.actionHash);
-    if (!addr) return null;
+    if (!addr || !boundTo(addr, className)) return null;
     const rec = await confirmRecord(kind, addr, action === "update");
     if (!rec) return null;
     const derived =

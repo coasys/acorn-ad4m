@@ -29,11 +29,13 @@ import {
   MEMBER_1,
   OUTCOME_A,
   OUTCOME_B,
+  TAG_T,
   connectionEntry,
   memberEntry,
   outcomeCommentEntry,
   profileEntry,
   smallOutcomeEntry,
+  tagEntry,
   uncertainOutcomeEntry,
   wireRecord,
 } from "./fixtures";
@@ -204,17 +206,54 @@ test("forged update of a record that does not exist -> null", async () => {
   assert.equal(d, null);
 });
 
-test("Outcome delete signal -> removed: [hash] once the fetch confirms it gone", async () => {
+// Lal round 2, P1: a deletion must be PROVEN, and the stock zomes expose
+// no read that proves one — fetch_* (get_latest_for_entry) answers None
+// alike for EntryDhtStatus::Dead, for an entry not yet gossiped and for a
+// failed get. So a delete hint never removes anything; removal is left to
+// the periodic full resync.
+test("delete hint whose record no longer fetches -> null, nothing removed (P1)", async () => {
+  const snapshot = mkSnapshot([{ class: "AcornOutcome", rec: outcomeA() }]);
   const d = await signalToDelta(
     {
       signalType: "Outcome",
       data: { entryType: "outcome", action: "delete", data: OUTCOME_A },
     },
-    ctx(new Map(), fetchOf({ outcomes: [] }))
+    ctx(snapshot, fetchOf({ outcomes: [] }))
   );
-  assert.ok(d);
-  assert.equal(d.changed.length, 0);
-  assert.deepEqual(d.removed, [OUTCOME_A]);
+  assert.equal(d, null);
+});
+
+test("delete hint for class X never touches a record mounted as class Y (P1)", async () => {
+  // a tag is mounted at T; a peer claims an OUTCOME at T was deleted, and
+  // T is (of course) absent from fetch_outcomes.
+  const tag = wireRecord(tagEntry(), { actionHash: TAG_T });
+  const snapshot = mkSnapshot([{ class: "AcornTag", rec: tag }]);
+  const d = await signalToDelta(
+    {
+      signalType: "Outcome",
+      data: { entryType: "outcome", action: "delete", data: TAG_T },
+    },
+    ctx(snapshot, fetchOf({ outcomes: [], tags: [tag] }))
+  );
+  assert.equal(d, null);
+});
+
+test("update hint for class X never rewrites a record mounted as class Y (P1)", async () => {
+  // address collision: a tag is mounted at T, and fetch_outcomes answers a
+  // record at T. A hint about an outcome must not remount T as an outcome.
+  const tag = wireRecord(tagEntry(), { actionHash: TAG_T });
+  const snapshot = mkSnapshot([{ class: "AcornTag", rec: tag }]);
+  const odd = wireRecord(smallOutcomeEntry(), { actionHash: TAG_T });
+  for (const action of ["create", "update"]) {
+    const d = await signalToDelta(
+      {
+        signalType: "Outcome",
+        data: { entryType: "outcome", action, data: odd },
+      },
+      ctx(snapshot, fetchOf({ outcomes: [odd], tags: [tag] }))
+    );
+    assert.equal(d, null, action);
+  }
 });
 
 test("forged delete of a record that still fetches -> null, nothing removed", async () => {
@@ -229,9 +268,9 @@ test("forged delete of a record that still fetches -> null, nothing removed", as
   assert.equal(d, null);
 });
 
-test("DeleteOutcomeFully -> outcome + 2 connections + 1 comment removed, parent changed", async () => {
-  // Snapshot: P --connAB--> C --connXC--> X, plus a comment on C. The
-  // delete took C, both connections and the comment; P and X fetch on.
+test("DeleteOutcomeFully hint whose records no longer fetch -> null (P1)", async () => {
+  // Snapshot: P --connAB--> C --connXC--> X, plus a comment on C. Every
+  // record the claim lists is absent from the fetch — still no proof.
   const outcomeX = () =>
     wireRecord(uncertainOutcomeEntry(), { actionHash: OUTCOME_X });
   const connXC = () =>
@@ -282,29 +321,16 @@ test("DeleteOutcomeFully -> outcome + 2 connections + 1 comment removed, parent 
       })
     )
   );
-  assert.ok(d);
-  assert.deepEqual(
-    [...d.removed].sort(),
-    [OUTCOME_B, CONNECTION_AB, CONNECTION_XC, COMMENT_1].sort()
-  );
-  // P lost the child edge to C; X lost its parent edge
-  const p = d.changed.find((e) => e.address === OUTCOME_A);
-  assert.ok(p, "parent outcome P must be in changed");
-  assert.equal(p.class, "AcornOutcome");
-  assert.ok(
-    !(Array.isArray(p.data.children) && p.data.children.includes(`${LANG}://${OUTCOME_B}`)),
-    `P.children still lists C: ${JSON.stringify(p.data.children)}`
-  );
-  const x = d.changed.find((e) => e.address === OUTCOME_X);
-  assert.ok(x, "child outcome X must be in changed");
-  assert.ok(!("parent" in x.data), `X.parent still set: ${JSON.stringify(x.data)}`);
+  assert.equal(d, null);
 });
 
-test("DeleteOutcomeFully only removes what the fetch confirms gone", async () => {
-  // the signal claims the connection and comment died with the outcome,
-  // but both still fetch — only the outcome itself is confirmed.
-  const comment = () =>
-    wireRecord(outcomeCommentEntry(), { actionHash: COMMENT_1 });
+test("DeleteOutcomeFully listing records of other classes removes nothing (P1)", async () => {
+  // the claim lists a mounted TAG among "deletedConnections"
+  const tag = wireRecord(tagEntry(), { actionHash: TAG_T });
+  const snapshot = mkSnapshot([
+    { class: "AcornOutcome", rec: outcomeA() },
+    { class: "AcornTag", rec: tag },
+  ]);
   const d = await signalToDelta(
     {
       signalType: "DeleteOutcomeFully",
@@ -313,27 +339,30 @@ test("DeleteOutcomeFully only removes what the fetch confirms gone", async () =>
         action: "delete",
         data: {
           outcomeActionHash: OUTCOME_B,
-          deletedConnections: [CONNECTION_AB],
+          deletedConnections: [TAG_T],
           deletedOutcomeMembers: [],
           deletedOutcomeVotes: [],
-          deletedOutcomeComments: [COMMENT_1],
+          deletedOutcomeComments: [],
           deletedEntryPoints: [],
         },
       },
     },
-    ctx(
-      new Map(),
-      fetchOf({
-        outcomes: [],
-        connections: [connAB()],
-        comments: [comment()],
-        outcomeMembers: [],
-        entryPoints: [],
-      })
-    )
+    ctx(snapshot, fetchOf({ outcomes: [outcomeA()], connections: [], tags: [tag] }))
   );
-  assert.ok(d);
-  assert.deepEqual(d.removed, [OUTCOME_B]);
+  assert.equal(d, null);
+});
+
+test("Member delete hint with no fetched member -> null, mounted member kept (P1)", async () => {
+  const rec = wireRecord(memberEntry(), { actionHash: MEMBER_1 });
+  const snapshot = mkSnapshot([{ class: "AcornMember", rec }]);
+  const d = await signalToDelta(
+    {
+      signalType: "Member",
+      data: { entry_type: "member", action: "delete", data: { agentPubKey: AGENT_A } },
+    },
+    ctx(snapshot, fetchOf({ members: [] }))
+  );
+  assert.equal(d, null);
 });
 
 test("Member signal with snake-case entry_type -> changed AcornMember", async () => {
@@ -419,7 +448,7 @@ test("Connection create -> changed connection + both ends re-expanded", async ()
   assert.equal(ch?.data.parent, `${LANG}://${OUTCOME_A}`);
 });
 
-test("Connection delete -> removed + both ends re-expanded", async () => {
+test("Connection delete hint whose record no longer fetches -> null (P1)", async () => {
   const snapshot = mkSnapshot([
     { class: "AcornOutcome", rec: outcomeA() },
     { class: "AcornOutcome", rec: outcomeB() },
@@ -435,12 +464,7 @@ test("Connection delete -> removed + both ends re-expanded", async () => {
       fetchOf({ connections: [], outcomes: [outcomeA(), outcomeB()] })
     )
   );
-  assert.ok(d);
-  assert.deepEqual(d.removed, [CONNECTION_AB]);
-  const p = d.changed.find((e) => e.address === OUTCOME_A);
-  assert.ok(p && !("children" in p.data));
-  const c = d.changed.find((e) => e.address === OUTCOME_B);
-  assert.ok(c && !("parent" in c.data));
+  assert.equal(d, null);
 });
 
 test("forged connection delete while it still fetches -> null", async () => {

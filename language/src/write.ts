@@ -395,7 +395,7 @@ async function createLocked(
               siblingOrder: typeof p.siblingOrder === "number" ? p.siblingOrder : 0,
             }
           : null;
-      const res = await ctx.call(fns.zome, fns.create, {
+      const res = await ctx.call(fns.zome, fns.create!, {
         entry,
         maybeLinkedOutcome,
       });
@@ -406,7 +406,7 @@ async function createLocked(
       }
     } else if (className === "AcornProjectMeta") {
       const entry = toEntry(className, createData(className, p, ctx), mctx);
-      const wr = await ctx.call(fns.zome, fns.create, {
+      const wr = await ctx.call(fns.zome, fns.create!, {
         input: entry,
         local: true,
       });
