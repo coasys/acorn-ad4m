@@ -143,7 +143,7 @@ test("setup: mount the language on a fresh perspective", async (t) => {
   t.diagnostic(`mounted ${L} on ${uuid}`);
 });
 
-test("stock outcome create+rename pushes a modelSubscribe update in < 3 s", async (t) => {
+test("stock outcome create+rename pushes a modelSubscribe update before the resync", async (t) => {
   const subscriptionId = `b4-${NONCE}`;
   const sub = await ad4m.rpc("perspective.modelSubscribe", {
     uuid,
@@ -171,7 +171,7 @@ test("stock outcome create+rename pushes a modelSubscribe update in < 3 s", asyn
   const renamed = waitForUpdate(
     subscriptionId,
     (row) => rowId(row) === url(R) && rowField(row, "content") === NEWNAME,
-    10000,
+    20000,
     "rename pushes the updated outcome"
   );
   const t0 = Date.now();
@@ -179,7 +179,13 @@ test("stock outcome create+rename pushes a modelSubscribe update in < 3 s", asyn
   await renamed;
   const latency = Date.now() - t0;
   console.log(`push latency: ${latency} ms`);
-  assert.ok(latency < 3000, `push took ${latency}ms (resync is ~15 s)`);
+  // B6: a signal is only an invalidation hint — the push waits for the
+  // update op to gossip in and verify through the zomes, so the bound is
+  // "before the ~15 s resync", not the old payload-trusted ~1 s.
+  assert.ok(
+    latency < 14000,
+    `push took ${latency}ms — did not beat the ~15 s resync`
+  );
 });
 
 test("stock delete_outcome_fully removes outcome, connection and comment", async (t) => {

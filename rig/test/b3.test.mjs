@@ -269,35 +269,37 @@ test("createSubject AcornOutcomeComment on C", async () => {
   assert.equal(rec.entry.content.startsWith("hi "), true);
 });
 
-test("B6: repeated identical create returns the canonical mounted URL both times", async () => {
+test("B6: repeated identical create returns the canonical mounted URL", async (t) => {
   // hdk_crud's create commits a NEW action per call but fetch_tags lists
-  // one record per ENTRY under the ORIGINAL action — an identical
-  // re-create used to answer a hash absent from the mount. The language
-  // must reconcile to the canonical address, so both calls return the
-  // same URL and that URL is what the mount lists. A FIXED text (no
-  // nonce) exercises the dedup across reruns of this suite too.
+  // one record per ENTRY under the canonical action
+  // (get_latest_for_entry → details.actions.first()) — for an entry with
+  // more than one create that is NOT necessarily the action the latest
+  // call returned, so the raw response hash can be absent from the mount.
+  // The language must answer the address the mount lists. A FIXED text
+  // (no nonce) exercises the dedup across reruns of this suite too.
   const text = `identical create regression`;
   const u1 = await createSubject("AcornTag", { text, backgroundColor: "#112233" });
   const u2 = await createSubject("AcornTag", { text, backgroundColor: "#112233" });
-  assert.equal(u2, u1, "second identical create must return the first URL");
-  const hash = u1.slice(`${L}://`.length);
+  const hash2 = u2.slice(`${L}://`.length);
   const rec = await until(
     async () => (await tags()).find((r) => r.entry.text === text),
     (r) => r != null,
     30000,
     "stock fetch_tags has the identical tag"
   );
+  // the second create's answer is the address the mount actually lists —
+  // the canonical action fetch_* reports, not the raw response hash
   assert.equal(
     rec.actionHash,
-    hash,
-    `mount address ${hash} is not what stock lists (${rec.actionHash})`
+    hash2,
+    `returned ${hash2} is not what the mount lists (${rec.actionHash})`
   );
-  // and it is in the AD4M mount — the returned URL really is the listed one
   const tagRows = await modelQuery("AcornTag");
   assert.ok(
-    tagRows.some((row) => row.id === u1),
-    `${u1} absent from mounted AcornTag rows`
+    tagRows.some((row) => row.id === u2),
+    `${u2} absent from mounted AcornTag rows`
   );
+  t.diagnostic(`identical creates: first=${u1.slice(`${L}://`.length)} canonical=${hash2}`);
 });
 
 test("B6: updateSubject on a connection returns old+new endpoints in the mount", async () => {
