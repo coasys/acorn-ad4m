@@ -19,6 +19,7 @@ import { rigEnv, RUN_DIR, REPO_DIR } from "./envfile.mjs";
 
 const env = rigEnv();
 const STATE = join(RUN_DIR, "stock-state.json");
+const JOINED_STATE = join(RUN_DIR, "stock-joined.json");
 const HAPP = join(REPO_DIR, "language", "vendor", "acorn.happ");
 const ADMIN_URL = `ws://127.0.0.1:${env.HC_ADMIN || "45310"}`;
 const SEED = env.SEED || "uid-rig-test-project";
@@ -275,7 +276,85 @@ if (isMain && cmd === "setup") {
   });
   console.log(JSON.stringify(members.map((m) => b64(m.entry.agentPubKey))));
   process.exit(0);
+} else if (isMain && cmd === "join") {
+  // node stock.mjs join <network_seed>
+  //   -> createCloneCell for a project created elsewhere (the AD4M side);
+  //      persists the joined cell to .run/stock-joined.json
+  const seed = process.argv[3];
+  if (!seed) {
+    console.log("usage: join <network_seed>");
+    process.exit(1);
+  }
+  const s = loadState();
+  const { adminWs, app } = await connectAppAndSign([
+    new Uint8Array(s.cellId[0]),
+    new Uint8Array(s.cellId[1]),
+  ]);
+  const clone = await app.createCloneCell({
+    role_name: "projects",
+    modifiers: { network_seed: seed },
+  });
+  const cell_id = clone.cell_id;
+  await signCreds(adminWs, cell_id);
+  writeFileSync(
+    JOINED_STATE,
+    JSON.stringify(
+      {
+        seed,
+        dnaHashB64: b64(cell_id[0]),
+        cellId: [Array.from(cell_id[0]), Array.from(cell_id[1])],
+      },
+      null,
+      2
+    )
+  );
+  console.log("joined cell:", b64(cell_id[0]), "seed:", seed);
+  await closeStock({ adminWs, app });
+  process.exit(0);
+} else if (isMain && cmd === "fetch") {
+  // node stock.mjs fetch <fn_name> [payloadJson] [--setup]
+  //   -> zome call on the joined cell (.run/stock-joined.json) when present,
+  //      else the setup cell; --setup forces the setup cell.
+  //   Payload defaults to the UI's shapes:
+  //     fetch_<type>s               -> {input:{All:null}, local:true}
+  //     meta/members/agents/whoami  -> {input:null,      local:true}
+  const fn = process.argv[3];
+  if (!fn) {
+    console.log("usage: fetch <fn_name> [payloadJson] [--setup]");
+    process.exit(1);
+  }
+  const rest = process.argv.slice(4);
+  const useSetup = rest.includes("--setup");
+  const payloadArg = rest.find((a) => !a.startsWith("--"));
+  const stateFile = !useSetup && existsSync(JOINED_STATE) ? JOINED_STATE : STATE;
+  const s = JSON.parse(readFileSync(stateFile, "utf8"));
+  const cid = [new Uint8Array(s.cellId[0]), new Uint8Array(s.cellId[1])];
+  const singleton =
+    !fn.startsWith("fetch_") ||
+    fn === "fetch_project_meta" ||
+    fn === "fetch_members" ||
+    fn === "fetch_agents" ||
+    fn === "fetch_agent_address" ||
+    fn === "fetch_entry_point_details";
+  const payload = payloadArg
+    ? JSON.parse(payloadArg)
+    : singleton
+      ? { input: null, local: true }
+      : { input: { All: null }, local: true };
+  const zome =
+    fn === "whoami" ||
+    fn === "fetch_agents" ||
+    fn === "fetch_agent_address" ||
+    fn === "create_whoami" ||
+    fn === "update_whoami"
+      ? "profiles"
+      : "projects";
+  const { adminWs, app } = await connectAppAndSign(cid);
+  const res = await callZome(app, cid, zome, fn, payload);
+  console.log(JSON.stringify(res, null, 2));
+  await closeStock({ adminWs, app });
+  process.exit(0);
 } else if (isMain) {
-  console.log("usage: setup|info|members");
+  console.log("usage: setup|info|members|join|fetch");
   process.exit(1);
 }
